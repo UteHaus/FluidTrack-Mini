@@ -1,3 +1,11 @@
 read selfServesKey.md
-src/.env
-src/FluidTrack.db
+.env
+data/*
+build/*
+dist/*
+backups/
+
+*/__pycache__/
+*.py[cod]
+
+*.db
