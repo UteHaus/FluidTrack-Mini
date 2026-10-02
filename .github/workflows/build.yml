@@ -2,16 +2,26 @@ name: Build binaries
 
 # Builds the PyInstaller app for Linux and Windows.
 # - Every push/PR to main/master: binaries are attached to the workflow run as artifacts.
-# - Pushing a tag like "v1.2.3": additionally creates a GitHub Release with both archives.
+# - Pushing a version tag ("v1.2.3" or "1.2.3"): creates a GitHub Release with
+#   RELEASE_NOTES.md as text and both archives as assets.
+# - Publishing a release in the GitHub web UI: both archives are attached to it.
 # - "Run workflow" button in the Actions tab: manual build.
 
 on:
   push:
     branches: [main, master]
-    tags: ["v*"]
+    tags: ["v*", "[0-9]*"]
   pull_request:
     branches: [main, master]
+  release:
+    types: [published]
   workflow_dispatch:
+
+# A tag created together with a release in the web UI can start a tag-push run
+# AND a release run -- let them run one after the other, not in parallel.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -90,7 +100,7 @@ jobs:
 
   release:
     name: GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -103,9 +113,12 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Create release
+      - name: Create release / attach assets
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
-          body_path: RELEASE_NOTES.md
-          generate_release_notes: true
+          # Releases written in the web UI keep their own text; only tag pushes
+          # (where the action creates the release) use RELEASE_NOTES.md.
+          body_path: ${{ github.event_name == 'push' && 'RELEASE_NOTES.md' || '' }}
+          generate_release_notes: ${{ github.event_name == 'push' }}
+          fail_on_unmatched_files: true
