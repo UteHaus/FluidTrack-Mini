@@ -49,6 +49,9 @@ jobs:
         shell: bash
         run: uv run python -m py_compile src/*.py
 
+      - name: Unit tests (USB adapter simulated)
+        run: uv run python -m unittest discover -s tests -v
+
       - name: Build with PyInstaller
         run: uv run pyinstaller --noconfirm FluidTrack-Mini.spec
 

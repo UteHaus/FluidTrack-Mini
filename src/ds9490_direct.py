@@ -13,21 +13,25 @@ driver (drivers/w1/masters/ds2490.c) -- reimplemented here from scratch in
 Python (no code copied).
 
 Requirements:
-    pip install pyusb
-    Linux: the kernel driver is detached automatically on startup (see
-           detach_kernel_driver below). May need root or a udev rule for
-           the DS9490R (idVendor=04fa, idProduct=2490).
-    Windows: pyusb needs a libusb-compatible driver for the device (e.g.
-           switch it to "WinUSB" via Zadig) -- the regular TMEX driver is
-           NOT usable by pyusb directly.
+    pyusb, plus a libusb-1.0 library:
+      Windows: shipped by the "libusb-package" Python package (a project
+               dependency). The DS9490R must use the WinUSB driver -- install it
+               once with Zadig (https://zadig.akeo.ie/). The Maxim/TMEX
+               "1-Wire Drivers" are NOT usable by libusb.
+      Linux:   system libusb-1.0; the ds2490 kernel driver is detached
+               automatically. Needs root or a udev rule for the DS9490R
+               (idVendor=04fa, idProduct=2490).
 
 Usage:
+    python ds9490_direct.py                      # find the key over USB, then read it
     python ds9490_direct.py 0c-0000000000ab
     python ds9490_direct.py 0c-0000000000ab --length 8192 --start 0
 """
 
 import argparse
 import datetime
+import os
+import sys
 import time
 
 import usb.core
@@ -49,6 +53,8 @@ MOD_PULSE_EN = 0x0000
 PULSE_SPUE = 0x02
 
 COMM_IM = 0x0001  # "immediate" execution
+COMM_D = 0x0008  # bit value for COMM_BIT_IO
+COMM_BIT_IO = 0x0020
 COMM_NTF = 0x0400  # request Result Register feedback (for presence diagnostics)
 COMM_1_WIRE_RESET = 0x0042
 COMM_BYTE_IO = 0x0052
@@ -64,10 +70,17 @@ FIFO_SIZE = 0x80  # 128-byte 1-Wire data buffer inside the DS2490
 RR_NRS = 0x01  # Reset: no presence detected (no device answered!)
 RR_SH = 0x02  # short circuit on the bus
 RR_CMP = 0x10  # compare error (e.g. during Match ROM: byte echoed back differs)
+RESULT_DEVICE_DETECT = 0xA5  # "new device on the bus" notice -- NOT an error code
+
+USB_TIMEOUT_MS = 2000  # generous: first transfers on Windows can be slow
+IDLE_TIMEOUT_S = 3.0  # max time to wait for the DS2490 to finish a command
 
 # Standard 1-Wire ROM commands (chip-independent)
 ROM_SKIP = 0xCC
 ROM_MATCH = 0x55
+ROM_SEARCH = 0xF0
+
+DS1996_FAMILY = 0x0C
 
 # DS1996-specific memory commands
 CMD_READ_MEMORY = 0xF0
@@ -88,89 +101,245 @@ def crc8_1wire(data: bytes) -> int:
 
 def rom_id_to_bytes(rom_id_str: str) -> bytes:
     """
-    Converts a ROM ID in the format 'ff-xxxxxxxxxxxx' (as shown in the Linux
-    w1_master_slaves file, WITHOUT the CRC byte) into the full 8 bytes needed
-    for a Match ROM command (including a freshly computed CRC8 as the last byte).
+    Converts a ROM ID like '0c-0000001db780' into the 8 bytes sent on the wire
+    for Match ROM: family, serial, CRC8.
+
+    The ID string uses the Linux sysfs notation: family byte, then the 48-bit
+    serial number printed MOST significant byte first. On the 1-Wire bus the
+    serial is transmitted LEAST significant byte first, so it must be reversed.
     """
-    family_str, serial_str = rom_id_str.split("-")
-    family_byte = bytes.fromhex(family_str)
-    serial_bytes = bytes.fromhex(serial_str)
-    partial = family_byte + serial_bytes
-    if len(partial) != 7:
+    try:
+        family_str, serial_str = rom_id_str.strip().lower().split("-")
+        family_byte = bytes.fromhex(family_str)
+        serial_bytes = bytes.fromhex(serial_str)
+    except ValueError as e:
+        raise ValueError(f"Invalid ROM ID: {rom_id_str!r}") from e
+    if len(family_byte) != 1 or len(serial_bytes) != 6:
         raise ValueError(f"Unexpected ROM ID length: {rom_id_str}")
-    crc = crc8_1wire(partial)
-    return partial + bytes([crc])
+    partial = family_byte + serial_bytes[::-1]
+    return partial + bytes([crc8_1wire(partial)])
+
+
+def rom_bytes_to_id(rom: bytes) -> str:
+    """Inverse of rom_id_to_bytes(): 8 wire-order ROM bytes -> '0c-0000001db780'.
+    Produces exactly the Linux sysfs notation, so IDs (and the record hashes
+    built from them) are identical no matter how the key was detected."""
+    if len(rom) != 8:
+        raise ValueError(f"ROM must be 8 bytes, got {len(rom)}")
+    if crc8_1wire(rom[:7]) != rom[7]:
+        raise ValueError(f"ROM CRC mismatch: {bytes(rom).hex()}")
+    return f"{rom[0]:02x}-{bytes(rom[1:7])[::-1].hex()}"
 
 
 class DS2490Error(RuntimeError):
     pass
 
 
+IS_WINDOWS = sys.platform.startswith("win")
+
+DRIVER_HINT = (
+    "On Windows the DS9490R needs the WinUSB driver (install it once with Zadig, "
+    "https://zadig.akeo.ie/) and must not be in use by another program "
+    "(e.g. PIUSI SelfService or a second FluidTrack instance)."
+    if IS_WINDOWS
+    else "On Linux, check the udev rule / permissions and that no other program "
+    "is using the adapter."
+)
+
+
+def _libusb_dll_candidates():
+    """Where libusb-1.0.dll can be on Windows, in order of preference."""
+    candidates = []
+    # PyInstaller build: the libusb-package hook copies the DLL into the
+    # bundle root (_internal/), where libusb_package itself does not look.
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        candidates.append(os.path.join(bundle_dir, "libusb-1.0.dll"))
+    # Source run: the DLL shipped inside the libusb-package wheel.
+    try:
+        import libusb_package
+
+        path = libusb_package.get_library_path()
+        if path:
+            candidates.append(str(path))
+    except Exception:
+        pass
+    return candidates
+
+
+def _usb_backend():
+    """pyusb cannot find libusb-1.0.dll on Windows by itself, so the DLL is
+    located explicitly. Elsewhere pyusb's default lookup (system libusb) is used.
+    Returns None to let pyusb try its own search (e.g. a DLL on PATH)."""
+    if not IS_WINDOWS:
+        return None
+    import usb.backend.libusb1
+
+    for path in _libusb_dll_candidates():
+        if os.path.isfile(path):
+            backend = usb.backend.libusb1.get_backend(find_library=lambda _name, p=path: p)
+            if backend is not None:
+                return backend
+    return None
+
+
 class DS9490:
-    """Minimal pyusb driver for the DS2490 chip inside the DS9490R adapter."""
+    """Minimal pyusb driver for the DS2490 chip inside the DS9490R adapter.
+
+    Use it as a context manager so the USB device is always released --
+    WinUSB allows only ONE open handle, so a leaked handle makes every
+    following open fail with "Access denied":
+
+        with DS9490() as ds:
+            ...
+    """
 
     def __init__(self):
-        dev = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
-        if dev is None:
-            raise DS2490Error(
-                "No DS9490R found. Is the adapter plugged in? "
-                "On Linux, try `sudo rmmod ds2490` first if the kernel driver "
-                "is already holding the device."
+        self.dev = None
+        self._interface = 0
+        self._claimed = False
+
+        try:
+            dev = usb.core.find(
+                idVendor=VENDOR_ID, idProduct=PRODUCT_ID, backend=_usb_backend()
             )
+        except usb.core.NoBackendError as e:
+            raise DS2490Error(
+                "No libusb backend available. "
+                + (
+                    "Install the 'libusb-package' Python package (run 'uv sync')."
+                    if IS_WINDOWS
+                    else "Install libusb-1.0 (e.g. 'sudo apt install libusb-1.0-0')."
+                )
+            ) from e
+        if dev is None:
+            raise DS2490Error("No DS9490R found. Is the adapter plugged in? " + DRIVER_HINT)
         self.dev = dev
 
         try:
-            if dev.is_kernel_driver_active(0):
-                dev.detach_kernel_driver(0)
-        except (usb.core.USBError, NotImplementedError):
-            pass  # e.g. not applicable on Windows
+            self._open()
+        except DS2490Error:
+            self.close()
+            raise
+        except (usb.core.USBError, NotImplementedError, ValueError, KeyError) as e:
+            self.close()
+            raise DS2490Error(f"Could not open the DS9490R: {e}. {DRIVER_HINT}") from e
 
-        dev.set_configuration()
-        cfg = dev.get_active_configuration()
-        intf = cfg[(0, 0)]
+    def __enter__(self):
+        return self
 
-        # Alternate Setting 3: 1ms interrupt status polling, 64-byte bulk packets
-        # (see the Linux kernel driver ds2490.c) -- speeds up polling.
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def __del__(self):
         try:
-            alt_intf = usb.util.find_descriptor(
-                cfg, bInterfaceNumber=intf.bInterfaceNumber, bAlternateSetting=3
-            )
-            if alt_intf is not None:
-                dev.set_interface_altsetting(
-                    interface=intf.bInterfaceNumber, alternate_setting=3
-                )
-                intf = alt_intf
-        except usb.core.USBError:
+            self.close()
+        except Exception:
             pass
 
-        self.ep_status = usb.util.find_descriptor(
-            intf,
-            custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
-            == usb.util.ENDPOINT_IN
-            and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_INTR,
+    def _open(self):
+        dev = self.dev
+
+        if not IS_WINDOWS:
+            try:
+                if dev.is_kernel_driver_active(0):
+                    dev.detach_kernel_driver(0)
+            except (usb.core.USBError, NotImplementedError):
+                pass
+
+        # WinUSB does not support SET_CONFIGURATION (NotImplementedError), and the
+        # Windows driver has configured the device already. So only configure
+        # the device if it isn't configured yet.
+        try:
+            cfg = dev.get_active_configuration()
+        except (usb.core.USBError, NotImplementedError):
+            cfg = None
+        if cfg is None:
+            dev.set_configuration()
+            cfg = dev.get_active_configuration()
+
+        intf = cfg[(0, 0)]
+        self._interface = intf.bInterfaceNumber
+
+        try:
+            usb.util.claim_interface(dev, self._interface)
+            self._claimed = True
+        except usb.core.USBError as e:
+            raise DS2490Error(f"DS9490R is busy or not accessible ({e}). {DRIVER_HINT}") from e
+
+        # Alternate Setting 3: 1ms interrupt status polling, 64-byte bulk packets
+        # (see the Linux kernel driver ds2490.c) -- speeds up polling. Optional:
+        # setting 0 works too, just slower.
+        alt_intf = usb.util.find_descriptor(
+            cfg, bInterfaceNumber=self._interface, bAlternateSetting=3
         )
-        self.ep_in = usb.util.find_descriptor(
-            intf,
-            custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
-            == usb.util.ENDPOINT_IN
-            and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK,
-        )
-        self.ep_out = usb.util.find_descriptor(
-            intf,
-            custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
-            == usb.util.ENDPOINT_OUT
-            and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK,
-        )
+        if alt_intf is not None:
+            try:
+                dev.set_interface_altsetting(interface=self._interface, alternate_setting=3)
+                intf = alt_intf
+            except (usb.core.USBError, NotImplementedError):
+                pass
+
+        def endpoint(direction, ep_type):
+            return usb.util.find_descriptor(
+                intf,
+                custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == direction
+                and usb.util.endpoint_type(e.bmAttributes) == ep_type,
+            )
+
+        self.ep_status = endpoint(usb.util.ENDPOINT_IN, usb.util.ENDPOINT_TYPE_INTR)
+        self.ep_in = endpoint(usb.util.ENDPOINT_IN, usb.util.ENDPOINT_TYPE_BULK)
+        self.ep_out = endpoint(usb.util.ENDPOINT_OUT, usb.util.ENDPOINT_TYPE_BULK)
         if not all([self.ep_status, self.ep_in, self.ep_out]):
             raise DS2490Error("Could not find the expected DS2490 endpoints.")
 
+        # Resynchronize the USB data toggles of all endpoints. Without this,
+        # host and DS2490 can disagree after a previous session, and the host
+        # silently drops the next reply packet as a "duplicate" -> bulk read
+        # timeout on every 2nd open (the old code got this as a side effect of
+        # set_configuration(), which WinUSB does not support).
+        for ep in (self.ep_status, self.ep_in, self.ep_out):
+            try:
+                dev.clear_halt(ep.bEndpointAddress)
+            except (usb.core.USBError, NotImplementedError):
+                pass
+
         self._reset_device()
 
-    # -- Low-level DS2490 commands -----------------------------------
+    def close(self):
+        """Releases the USB device (safe to call more than once)."""
+        dev, self.dev = self.dev, None
+        if dev is None:
+            return
+        if self._claimed:
+            try:
+                usb.util.release_interface(dev, self._interface)
+            except Exception:
+                pass
+            self._claimed = False
+        try:
+            usb.util.dispose_resources(dev)
+        except Exception:
+            pass
+
+    # -- Low-level USB transfers (all USB errors become DS2490Error) -------
+
+    def _usb(self, what, func, *args, **kwargs):
+        if self.dev is None:
+            raise DS2490Error("DS9490R is closed.")
+        try:
+            return func(*args, **kwargs)
+        except usb.core.USBTimeoutError as e:
+            raise DS2490Error(f"USB timeout during {what}.") from e
+        except (usb.core.USBError, NotImplementedError) as e:
+            raise DS2490Error(f"USB error during {what}: {e}") from e
 
     def _send_control(self, cmd_type, value, index=0):
-        self.dev.ctrl_transfer(
-            VENDOR_REQUEST_TYPE, cmd_type, value, index, None, timeout=1000
+        self._usb(
+            "control transfer",
+            self.dev.ctrl_transfer,
+            VENDOR_REQUEST_TYPE, cmd_type, value, index, None, timeout=USB_TIMEOUT_MS,
         )
 
     def _reset_device(self):
@@ -178,73 +347,192 @@ class DS9490:
         self._send_control(MODE_CMD, MOD_PULSE_EN, PULSE_SPUE)
 
     def _recv_status(self) -> bytes:
+        size = max(ST_SIZE, self.ep_status.wMaxPacketSize)
         return bytes(
-            self.dev.read(self.ep_status.bEndpointAddress, ST_SIZE, timeout=1000)
+            self._usb(
+                "status read",
+                self.dev.read, self.ep_status.bEndpointAddress, size, timeout=USB_TIMEOUT_MS,
+            )
         )
 
-    def _wait_idle(self, max_polls=100):
-        for _ in range(max_polls):
+    def _wait_idle(self) -> bytes:
+        """Polls the status endpoint until the DS2490 is idle. Returns all
+        Result Register bytes (status bytes 16+) seen while waiting -- a result
+        can arrive in an earlier status packet than the idle flag."""
+        deadline = time.monotonic() + IDLE_TIMEOUT_S
+        results = bytearray()
+        while True:
             status = self._recv_status()
+            if len(status) > 16:
+                results.extend(status[16:])
             if len(status) >= 9 and (status[8] & ST_IDLE):
-                return status
+                return bytes(results)
+            if time.monotonic() > deadline:
+                raise DS2490Error("Timeout: DS2490 never became idle.")
             time.sleep(0.001)
-        raise DS2490Error("Timeout: DS2490 never became idle.")
 
-    def onewire_reset(self, check_presence=False):
+    def _read_data(self, length: int) -> bytes:
+        """Reads exactly `length` bytes from the bulk IN pipe. The read buffer
+        is rounded up to whole USB packets -- WinUSB/libusb report an overflow
+        error if the buffer is smaller than the packet the device sends."""
+        packet = self.ep_in.wMaxPacketSize or 64
+        deadline = time.monotonic() + IDLE_TIMEOUT_S
+        result = bytearray()
+        while len(result) < length:
+            missing = length - len(result)
+            size = -(-missing // packet) * packet
+            chunk = self._usb(
+                "bulk read", self.dev.read, self.ep_in.bEndpointAddress, size, timeout=USB_TIMEOUT_MS
+            )
+            result.extend(chunk)
+            if len(result) < length and time.monotonic() > deadline:
+                raise DS2490Error(f"Timeout: got only {len(result)} of {length} bytes.")
+        if len(result) > length:
+            raise DS2490Error(
+                f"Unexpected data from DS2490: expected {length} bytes, got {len(result)}."
+            )
+        return bytes(result)
+
+    def _write_data(self, data: bytes):
+        written = self._usb(
+            "bulk write", self.dev.write, self.ep_out.bEndpointAddress, data, timeout=USB_TIMEOUT_MS
+        )
+        if written != len(data):
+            raise DS2490Error(f"Bulk write incomplete: {written} of {len(data)} bytes.")
+
+    # -- 1-Wire primitives ---------------------------------------------------
+
+    def onewire_reset(self, check_presence=False) -> bool:
+        """Sends a 1-Wire reset. Returns True if at least one device answered
+        with a presence pulse. Raises DS2490Error on a short circuit."""
         flags = COMM_1_WIRE_RESET | COMM_IM
         if check_presence:
             flags |= COMM_NTF
         self._send_control(COMM_CMD, flags, SPEED_NORMAL)
-        status = self._wait_idle()
+        results = self._wait_idle()
+
+        errors = [b for b in results if b != RESULT_DEVICE_DETECT]
+        if any(b & RR_SH for b in errors):
+            raise DS2490Error("Short circuit detected on the 1-Wire bus.")
+        presence = not any(b & RR_NRS for b in errors)
+
         if check_presence:
-            extra = status[16:]  # Result Register bytes, if present
-            if extra and (extra[0] & RR_NRS):
-                print("    [!] RR_NRS set: NO presence pulse detected -- "
-                      "no device responded to the reset!")
-            elif extra and (extra[0] & RR_SH):
-                print("    [!] RR_SH set: short circuit detected on the 1-Wire bus!")
+            if presence:
+                print(f"    [i] Presence OK (result bytes: {results.hex() or 'none'})")
             else:
-                print(f"    [i] Status after reset: {status.hex()} (presence OK unless RR_NRS/RR_SH above)")
+                print("    [!] RR_NRS set: NO presence pulse -- no device responded to the reset!")
+        return presence
 
     def write_byte(self, byte: int) -> int:
         self._send_control(COMM_CMD, COMM_BYTE_IO | COMM_IM, byte)
         self._wait_idle()
-        echoed = self.dev.read(self.ep_in.bEndpointAddress, 1, timeout=1000)
-        return echoed[0]
+        return self._read_data(1)[0]
 
     def read_byte(self) -> int:
         return self.write_byte(0xFF)
+
+    def touch_bit(self, bit: int) -> int:
+        """Writes one bit (1 = read slot) and returns the bit read back."""
+        self._send_control(COMM_CMD, COMM_BIT_IO | COMM_IM | (COMM_D if bit else 0), 0)
+        self._wait_idle()
+        return self._read_data(1)[0] & 0x01
 
     def read_block(self, length: int) -> bytes:
         result = bytearray()
         remaining = length
         while remaining > 0:
             chunk_len = min(remaining, FIFO_SIZE)
-            dummy = bytes([0xFF] * chunk_len)
-            self.dev.write(self.ep_out.bEndpointAddress, dummy, timeout=1000)
+            self._write_data(bytes([0xFF] * chunk_len))
             self._send_control(COMM_CMD, COMM_BLOCK_IO | COMM_IM, chunk_len)
             self._wait_idle()
-            chunk = self.dev.read(self.ep_in.bEndpointAddress, chunk_len, timeout=2000)
-            result.extend(chunk)
+            result.extend(self._read_data(chunk_len))
             remaining -= chunk_len
         return bytes(result)
 
     # -- Higher-level 1-Wire ROM functions ---------------------------------
+
+    def search_roms(self, family=None, max_devices=16):
+        """
+        Standard 1-Wire Search ROM (Maxim application note 187), done in
+        software via single-bit I/O -- works on every OS, no kernel driver
+        needed. Returns a list of 8-byte ROMs in wire order.
+
+        family: if given, only searches for a device of this family code
+            ("target setup" from AN187) and returns at most one ROM.
+        """
+        rom = bytearray(8)
+        last_discrepancy = 0
+        if family is not None:
+            rom[0] = family
+            last_discrepancy = 64
+
+        found = []
+        for _ in range(max_devices):
+            if not self.onewire_reset():
+                self._reset_device()  # DS2490 halts after an error result
+                return found
+            self.write_byte(ROM_SEARCH)
+
+            last_zero = 0
+            for bit_number in range(1, 65):
+                index, mask = (bit_number - 1) // 8, 1 << ((bit_number - 1) % 8)
+                id_bit = self.touch_bit(1)
+                cmp_bit = self.touch_bit(1)
+                if id_bit and cmp_bit:
+                    return found  # no device answered this search pass
+                if id_bit != cmp_bit:
+                    direction = id_bit
+                else:
+                    if bit_number < last_discrepancy:
+                        direction = 1 if rom[index] & mask else 0
+                    else:
+                        direction = 1 if bit_number == last_discrepancy else 0
+                    if direction == 0:
+                        last_zero = bit_number
+                if direction:
+                    rom[index] |= mask
+                else:
+                    rom[index] &= ~mask & 0xFF
+                self.touch_bit(direction)
+
+            if crc8_1wire(bytes(rom[:7])) != rom[7]:
+                raise DS2490Error(
+                    f"CRC error during ROM search ({bytes(rom).hex()}) -- bad contact?"
+                )
+            if family is not None:
+                return [bytes(rom)] if rom[0] == family else []
+            found.append(bytes(rom))
+            last_discrepancy = last_zero
+            if last_discrepancy == 0:
+                break
+        return found
 
     def skip_rom(self, debug=False):
         self.onewire_reset(check_presence=debug)
         self.write_byte(ROM_SKIP)
 
     def match_rom(self, rom_id_str: str, debug=False):
-        self.onewire_reset(check_presence=debug)
         rom_bytes = rom_id_to_bytes(rom_id_str)
+        if not self.onewire_reset(check_presence=debug):
+            self._reset_device()
+            raise DS2490Error("No device answered the 1-Wire reset (key removed?).")
         if debug:
             print(f"    [i] Sending Match ROM (0x55) + ROM bytes: {rom_bytes.hex()}")
         self.write_byte(ROM_MATCH)
         for b in rom_bytes:
             echoed = self.write_byte(b)
-            if debug and echoed != b:
-                print(f"    [!] Echo mismatch sending 0x{b:02x}: DS2490 reported 0x{echoed:02x} back")
+            if echoed != b:
+                raise DS2490Error(
+                    f"Match ROM echo mismatch (sent 0x{b:02x}, got 0x{echoed:02x}) -- bad contact?"
+                )
+
+
+def find_ds1996_rom_id_usb():
+    """Detects a DS1996 key directly over USB (no kernel driver needed).
+    Returns its ID in sysfs notation ('0c-...') or None if no key is present."""
+    with DS9490() as ds:
+        roms = ds.search_roms(family=DS1996_FAMILY)
+    return rom_bytes_to_id(roms[0]) if roms else None
 
 
 def read_ds1996_memory(
@@ -522,7 +810,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Direct USB read of a DS1996 via the DS9490R (pyusb, no kernel/TMEX driver)"
     )
-    parser.add_argument("rom_id", help="ROM ID of the key, e.g. 0c-0000000000ab")
+    parser.add_argument(
+        "rom_id", nargs="?",
+        help="ROM ID of the key, e.g. 0c-0000000000ab (default: search the bus over USB)",
+    )
     parser.add_argument(
         "--length", type=int, default=8192, help="Number of bytes to read (default: 8192 = 64 kbit)"
     )
@@ -538,16 +829,22 @@ def main():
     )
     args = parser.parse_args()
 
-    if not args.rom_id.lower().startswith("0c-"):
+    if args.rom_id is None:
+        print("[+] Searching the 1-Wire bus for a DS1996 key...")
+        args.rom_id = find_ds1996_rom_id_usb()
+        if args.rom_id is None:
+            raise SystemExit("[-] No DS1996 key found on the bus.")
+        print(f"[+] Found key: {args.rom_id}")
+    elif not args.rom_id.lower().startswith("0c-"):
         print("[!] Warning: ROM ID does not start with '0c-' (DS1996 family). Continuing anyway.")
 
     print("[+] Connecting to the DS9490R...")
-    ds = DS9490()
-    print(f"[+] Reading {args.length} bytes from address 0x{args.start:04x} of {args.rom_id} "
-          f"(rom-mode={args.rom_mode})...")
-    data = read_ds1996_memory(
-        ds, args.rom_id, args.start, args.length, rom_mode=args.rom_mode, debug=args.debug
-    )
+    with DS9490() as ds:
+        print(f"[+] Reading {args.length} bytes from address 0x{args.start:04x} of {args.rom_id} "
+              f"(rom-mode={args.rom_mode})...")
+        data = read_ds1996_memory(
+            ds, args.rom_id, args.start, args.length, rom_mode=args.rom_mode, debug=args.debug
+        )
 
     print()
     print(hexdump(data))

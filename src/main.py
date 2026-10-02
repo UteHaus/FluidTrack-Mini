@@ -9,10 +9,17 @@ from dotenv import load_dotenv
 
 # Import custom architecture modules
 from database import FuelDatabase
+from ds9490_direct import (
+    DS9490,
+    DS2490Error,
+    erase_ds1996_memory,
+    find_ds1996_rom_id_usb,
+    read_ds1996_memory,
+    scan_records,
+)
 from nextcloud import NextcloudTablesSync
-from ds9490_direct import DS9490, read_ds1996_memory, scan_records, erase_ds1996_memory, DS2490Error
-
-from paths import APP_DIR as SCRIPT_DIR, ENV_PATH
+from paths import APP_DIR as SCRIPT_DIR
+from paths import ENV_PATH
 
 if os.path.exists(ENV_PATH):
     load_dotenv(ENV_PATH)
@@ -45,36 +52,60 @@ def set_delete_key_after_sync(enabled):
     DELETE_KEY_AFTER_SYNC = bool(enabled)
 
 
-def find_ds1996_rom_id():
+def _find_ds1996_rom_id_sysfs():
     """
-    Still uses the Linux w1 kernel subsystem, but ONLY to detect which
-    ROM ID(s) are currently on the bus -- that part has always worked
-    reliably. Actually reading the memory contents no longer goes through
-    the (incomplete, for family 0x0c) sysfs files rw/memory/eeprom, but
-    directly over USB via ds9490_direct.py.
+    Linux only: asks the w1 kernel subsystem which ROM IDs are on the bus.
+    Returns (available, rom_id): available=False if no w1 bus master exists
+    (Windows, module not loaded, or the kernel driver was detached by an
+    earlier direct USB access).
 
     Explicitly filters for the DS1996 family (prefix '0c-'), since a second
     device without user memory can also be on the bus (e.g. a DS1420
     identification chip, family 0x81).
     """
     if not os.path.isdir(W1_DEVICES_DIR):
-        return None
+        return False, None
 
     master_dirs = [d for d in os.listdir(W1_DEVICES_DIR) if d.startswith("w1_bus_master")]
     if not master_dirs:
-        return None
+        return False, None
 
     slaves_file = os.path.join(W1_DEVICES_DIR, master_dirs[0], "w1_master_slaves")
     if not os.path.exists(slaves_file):
-        return None
+        return False, None
 
     with open(slaves_file, "r") as f:
         candidates = [line.strip() for line in f if line.strip() and "not found" not in line]
 
     for rom_id in candidates:
         if rom_id.lower().startswith(DS1996_FAMILY_PREFIX):
-            return rom_id
-    return None
+            return True, rom_id
+    return True, None
+
+
+_last_usb_error = None
+
+
+def find_ds1996_rom_id():
+    """
+    Detects the DS1996 key's ROM ID. Uses the Linux w1 sysfs files when they
+    exist (known to work), otherwise searches the 1-Wire bus directly over
+    USB -- the only option on Windows. Both return the same ID notation.
+    """
+    global _last_usb_error
+    available, rom_id = _find_ds1996_rom_id_sysfs()
+    if available:
+        return rom_id
+    try:
+        rom_id = find_ds1996_rom_id_usb()
+        _last_usb_error = None
+        return rom_id
+    except DS2490Error as e:
+        # Only log when the error changes, not on every poll cycle.
+        if str(e) != _last_usb_error:
+            print(f"[!] USB key detection failed: {e}")
+            _last_usb_error = str(e)
+        return None
 
 
 def format_license_plate(raw_value):
@@ -117,8 +148,8 @@ def read_all_transactions(rom_id):
     a list of fully parsed transactions -- including a combined ISO
     timestamp (instead of separate date/time strings) and a dedup hash.
     """
-    ds = DS9490()
-    raw_data = read_ds1996_memory(ds, rom_id, start_addr=0, length=8192, rom_mode="skip")
+    with DS9490() as ds:
+        raw_data = read_ds1996_memory(ds, rom_id, start_addr=0, length=8192)
 
     # Station number from the 16-byte header (bytes 10-15, see reverse-engineering notes)
     station = raw_data[10:16].decode("ascii", errors="replace").strip()
@@ -360,14 +391,14 @@ def poll_once(db, cloud, nextcloud_enabled):
                 "confirmed synced -- erasing key memory..."
             )
             try:
-                ds = DS9490()
-                erase_ds1996_memory(ds, rom_id)
+                with DS9490() as ds:
+                    erase_ds1996_memory(ds, rom_id)
 
-                # Safety verification: after erasing, scan_records() should
-                # no longer find anything.
-                verify_data = read_ds1996_memory(
-                    ds, rom_id, start_addr=0, length=8192, rom_mode="skip"
-                )
+                    # Safety verification: after erasing, scan_records() should
+                    # no longer find anything.
+                    verify_data = read_ds1996_memory(
+                        ds, rom_id, start_addr=0, length=8192
+                    )
                 remaining = scan_records(verify_data)
                 if remaining:
                     print(

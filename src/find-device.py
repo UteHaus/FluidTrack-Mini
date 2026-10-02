@@ -1,27 +1,47 @@
-import os
-import usb
-import glob
+#!/usr/bin/env python3
+"""
+FluidTrack-Mini: adapter diagnostics (Linux and Windows)
 
-BASE_DIR = "/sys/bus/w1/devices/"
-base_dir = '/sys/bus/w1/devices/'
-device_folder = glob.glob(base_dir + '81-*')[0]
-device_file = device_folder + '/w1_slave'
+Checks step by step whether the DS9490R USB adapter can be opened and which
+1-Wire devices are on the bus -- directly over USB, no kernel driver needed.
+
+Usage:
+    uv run python find-device.py
+"""
+
+import sys
+
+from ds9490_direct import DS9490, DS2490Error, rom_bytes_to_id
+
+FAMILY_NAMES = {
+    0x0C: "DS1996 fuel key (64 kbit NV-RAM)",
+    0x01: "DS1990/DS2401 ID chip",
+    0x81: "DS1420 ID chip (built into the DS9490R)",
+}
 
 
-def read_ibutton():
-# 1-Wire Gerät im Dateisystem finden
+def main():
+    print(f"[i] Platform: {sys.platform}")
+    try:
+        with DS9490() as ds:
+            print("[OK] DS9490R opened over USB.")
+            roms = ds.search_roms()
+    except DS2490Error as e:
+        print(f"[!] {e}")
+        return 1
 
-    dev = usb.core.find(idVendor=0x04FA, idProduct=0x2490)
+    if not roms:
+        print("[-] No 1-Wire devices found on the bus.")
+        return 1
 
-    if dev is None:
-        print("❌ DS9490R Adapter not found.")
-    else:
-        print("✅ DS9490R works!")
+    print(f"[OK] {len(roms)} device(s) on the 1-Wire bus:")
+    for rom in roms:
+        name = FAMILY_NAMES.get(rom[0], "unknown family")
+        print(f"     {rom_bytes_to_id(rom)}  {name}")
+    if not any(rom[0] == 0x0C for rom in roms):
+        print("[-] No DS1996 key detected -- place the key on the reader.")
+    return 0
+
 
 if __name__ == "__main__":
-    if os.path.exists(BASE_DIR):
-        read_ibutton()
-    else:
-        print(
-            f"Fehler: {BASE_DIR} existiert nicht. Ist 1-Wire in der config.txt aktiviert?"
-        )
+    sys.exit(main())

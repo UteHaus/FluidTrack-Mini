@@ -23,7 +23,7 @@ else
 endif
 
 .DEFAULT_GOAL := help
-.PHONY: help sync update run run-cli login cloud-sync check find-device inspect-key \
+.PHONY: help sync update run run-cli login cloud-sync check test find-device inspect-key \
         backup-db build build-linux build-windows run-build package clean udev
 
 help: ## Show this help
@@ -58,7 +58,7 @@ cloud-sync: ## One-off: compare local DB with Nextcloud and upload missing rows
 
 # --- Hardware / diagnostics --------------------------------------------------
 
-find-device: ## Check whether the DS9490R USB adapter is detected
+find-device: ## Open the DS9490R over USB and list all 1-Wire devices
 	cd $(SRC) && $(UV) run python find-device.py
 
 inspect-key: ## Hexdump the raw key memory (saves a .bin copy)
@@ -76,6 +76,9 @@ udev: ## Linux: install udev rule so the DS9490R works without sudo
 check: ## Syntax-check all Python sources
 	$(UV) run python -m py_compile $(wildcard $(SRC)/*.py)
 	@echo "OK"
+
+test: ## Run the unit tests (USB adapter simulated, no hardware needed)
+	$(UV) run python -m unittest discover -s tests -v
 
 backup-db: ## Copy the source and build databases into backups/ (timestamped)
 	@mkdir -p $(BACKUPS)
@@ -141,4 +144,4 @@ endif
 # --- Cleanup -----------------------------------------------------------------
 
 clean: ## Remove build cache and __pycache__ (keeps dist/ with .env and DB)
-	rm -rf build $(SRC)/__pycache__
+	rm -rf build $(SRC)/__pycache__ dist .venv

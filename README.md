@@ -26,7 +26,7 @@ Designed for **PIUSI fuel management systems** that identify drivers/vehicles vi
 
 > 🐧 **Linux notes:**
 > - The DS9490R does **not** create a virtual serial port (no `ttyUSB0`/`ttyACM0`) — it's a native USB device.
-> - The `ds2490` kernel module (typically auto-loaded, or `sudo modprobe ds2490`) is still used, but **only** to enumerate which 1-Wire ROM IDs are currently on the bus via `/sys/bus/w1/devices/.../w1_master_slaves`. The actual reading/writing of key memory bypasses the kernel driver entirely and talks to the DS2490 directly over USB — this is what makes reading the DS1996 family reliable in the first place.
+> - The `ds2490` kernel module is **optional**. If it is loaded, the key's ROM ID is taken from `/sys/bus/w1/devices/.../w1_master_slaves`. Otherwise the app searches the 1-Wire bus itself over USB. Reading and writing key memory always bypasses the kernel driver and talks to the DS2490 directly over USB, which is what makes reading the DS1996 family reliable in the first place.
 > - You'll likely need a **udev rule** so the adapter is accessible without `sudo`:
 >   ```
 >   # /etc/udev/rules.d/99-ds9490.rules
@@ -34,12 +34,17 @@ Designed for **PIUSI fuel management systems** that identify drivers/vehicles vi
 >   ```
 >   Then: `sudo udevadm control --reload-rules && sudo udevadm trigger`, and re-plug the adapter.
 
-> 🪟 **Windows notes:** `pyusb` needs a libusb-compatible driver for the DS9490R (e.g. install one via [Zadig](https://zadig.akeo.ie/), selecting **WinUSB**). The vendor's official TMEX driver, if installed, is *not* usable by `pyusb` directly.
+> 🪟 **Windows notes:**
+> - The DS9490R must use the **WinUSB** driver. Install it once with [Zadig](https://zadig.akeo.ie/): enable *Options → List All Devices*, select the adapter (USB ID `04FA 2490`), choose **WinUSB**, and click *Replace Driver*.
+> - The Maxim/TMEX "1-Wire Drivers" are **not** usable. PIUSI SelfService relies on them, so it can't use the adapter while WinUSB is installed. You can switch back in Device Manager via *Driver → Roll Back Driver*.
+> - The `libusb-1.0.dll` library ships with the `libusb-package` dependency and is bundled into the build automatically.
+> - Key detection works over USB, so no 1-Wire kernel or vendor driver is needed. Run `make find-device` to check the setup.
 
 ## 🛠️ Repository File Structure
 
 * **`main.py`** — Runtime loop: detects the key's ROM ID, reads its full memory over USB, parses transactions, deduplicates, stores locally, syncs to Nextcloud (if configured), and optionally erases the key.
-* **`ds9490_direct.py`** — Low-level DS2490 USB protocol implementation (`pyusb`): reset, byte I/O, block reads, Match ROM addressing, Write/Read/Copy Scratchpad, plus the transaction-record parser (`scan_records`).
+* **`ds9490_direct.py`** — Low-level DS2490 USB protocol implementation (`pyusb`): reset, bit/byte I/O, block reads, 1-Wire ROM search, Match ROM addressing, Write/Read/Copy Scratchpad, plus the transaction-record parser (`scan_records`). Works on Linux and Windows.
+* **`find-device.py`** — Diagnostics: opens the adapter over USB and lists all 1-Wire devices on the bus.
 * **`database.py`** — Local SQLite schema, migrations, hash-based dedup lookups, and row status tracking.
 * **`nextcloud.py`** — OCS-REST-API communication, table auto-provisioning, and row uploads. Fully optional — see below.
 * **`nextcloud_login.py`** — One-time interactive setup script: browser-based Nextcloud login (Login Flow v2), writes credentials into `.env` automatically.
