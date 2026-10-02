@@ -1,0 +1,105 @@
+name: Build binaries
+
+# Builds the PyInstaller app for Linux and Windows.
+# - Every push/PR to main/master: binaries are attached to the workflow run as artifacts.
+# - Pushing a tag like "v1.2.3": additionally creates a GitHub Release with both archives.
+# - "Run workflow" button in the Actions tab: manual build.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Oldest supported Ubuntu runner -> binary runs on older glibc systems too.
+          - os: ubuntu-22.04
+            name: linux
+            archive: FluidTrack-Mini-linux.tar.gz
+          - os: windows-latest
+            name: windows
+            archive: FluidTrack-Mini-windows.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python and dependencies
+        # Python version comes from .python-version, packages from uv.lock
+        # (includes the dev group with PyInstaller).
+        run: uv sync --frozen
+
+      - name: Syntax check
+        shell: bash
+        run: uv run python -m py_compile src/*.py
+
+      - name: Build with PyInstaller
+        run: uv run pyinstaller --noconfirm FluidTrack-Mini.spec
+
+      - name: Copy configuration template
+        shell: bash
+        run: cp env.example dist/FluidTrack-Mini/env.example
+
+      - name: Smoke test (tkinter is bundled)
+        if: matrix.name == 'linux'
+        # Starts the GUI on a virtual display for a few seconds. Exit code 124
+        # (killed by timeout) means it was still running -> OK.
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb > /dev/null
+          set +e
+          timeout 10 xvfb-run -a dist/FluidTrack-Mini/FluidTrack-Mini
+          code=$?
+          # The test run created a sample database next to the executable -- don't ship it.
+          rm -f dist/FluidTrack-Mini/FluidTrack.db dist/FluidTrack-Mini/.env
+          if [ "$code" -ne 124 ]; then echo "App exited early with code $code"; exit 1; fi
+
+      - name: Package (Linux)
+        if: matrix.name == 'linux'
+        run: tar -czf ${{ matrix.archive }} -C dist FluidTrack-Mini
+
+      - name: Package (Windows)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/FluidTrack-Mini -DestinationPath ${{ matrix.archive }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FluidTrack-Mini-${{ matrix.name }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

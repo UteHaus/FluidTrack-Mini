@@ -93,6 +93,13 @@ The built app reads `.env` and stores `FluidTrack.db` **next to the executable**
 
 The window shows the Nextcloud connection state: green means connected with the table ready, red means not connected (reason shown), and grey means not configured. The connection is re-checked every minute. A missing or outdated `NEXTCLOUD_TABLE_ID` is resolved automatically by table title, and the table is created if it doesn't exist.
 
+### CI Builds (GitHub Actions)
+The workflow in `.github/workflows/build.yml` builds the app on a Linux and a Windows runner. Every push to `main`/`master` attaches both archives to the workflow run under **Actions → Artifacts**. Pushing a version tag creates a GitHub Release with both archives:
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+The archives contain no `.env` and no database. Copy `env.example` to `.env` next to the executable.
+
 ### Execution Flow
 1. `main.py` boots, loads `.env`, and initializes/migrates the local SQLite schema.
 2. If Nextcloud is configured, `nextcloud.py` verifies/creates the target Table; otherwise cloud sync is skipped entirely (this is fully supported, not a fallback/error state).
