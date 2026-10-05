@@ -18,7 +18,7 @@ Gedacht für **PIUSI-Tankmanagementsysteme**, die Fahrer/Fahrzeuge über einen r
 * **Hash-basierte Duplikaterkennung:** Jeder Tankvorgang erhält einen stabilen Inhalts-Hash. Wird derselbe Schlüssel erneut gelesen (z. B. bevor er synchronisiert/gelöscht wurde), entstehen weder lokal noch in Nextcloud doppelte Einträge.
 * **Nextcloud ist optional:** Läuft problemlos nur mit lokalem SQLite. Sind Nextcloud-Zugangsdaten hinterlegt, wird die Zieltabelle automatisch angelegt (Spalten: Station, Timestamp, Liters, Operator, KeyID) und neue Zeilen werden synchronisiert.
 * **Nextcloud-Anmeldung im Browser:** Optionale einmalige Einrichtung (`nextcloud_login.py`) über den offiziellen Nextcloud „Login Flow v2“ – derselbe Mechanismus wie beim Nextcloud-Desktop-Client. Kein manuelles Erstellen eines App-Passworts nötig.
-* **Optionales Löschen des Schlüssels:** Kann den Transaktionsbereich des Schlüssels automatisch löschen, sobald *jeder* Eintrag darauf nachweislich gespeichert (und, falls aktiviert, mit Nextcloud synchronisiert) ist. Muss ausdrücklich in `.env` aktiviert werden, standardmäßig aus.
+* **Optionales Löschen des Schlüssels:** Kann den Schlüssel automatisch löschen, sobald *jeder* Eintrag darauf nachweislich gespeichert (und, falls aktiviert, mit Nextcloud synchronisiert) ist. Das Verfahren entspricht der Original-Software von PIUSI. Muss ausdrücklich aktiviert werden, standardmäßig aus.
 * **Kennzeichen-Formatierung:** Wandelt Kennzeichen in Punktschreibweise (`AB.CD.1234`) vom Schlüssel in die übliche Schreibweise (`AB-CD 1234`) um. Gerätenamen, die nicht dem Kennzeichenmuster entsprechen (z. B. `FORKLIFT`, `EXCAVATOR-2`), bleiben unverändert.
 
 ## 📋 Hardware- und Systemvoraussetzungen
@@ -74,6 +74,15 @@ cp env.example src/.env
 ```
 Beim Start aus dem Quellcode liest die App `src/.env`. Die gebaute App liest die `.env` neben ihrer ausführbaren Datei. Jede Einstellung ist optional. Ohne Nextcloud-Zugangsdaten speichert die App nur lokal. `NEXTCLOUD_TABLE_ID` wird automatisch ausgefüllt.
 
+### Mehrere Nutzer, eine Tabelle
+Jeder Nutzer meldet sich mit seinem eigenen Nextcloud-Konto an, alle Einträge sollen aber in **einer** Tabelle landen:
+
+1. Der erste Nutzer richtet FluidTrack-Mini wie gewohnt ein. Die App legt die Tabelle an.
+2. Auf dieser Installation `NEXTCLOUD_SHARE_WITH` in der `.env` auf eine Nextcloud-Gruppe oder einen Nutzer setzen (z. B. `Fahrer`) und neu starten. Die App teilt die Tabelle mit Lese- und Anlegerecht. Alternativ in der Weboberfläche von Nextcloud Tables mit mindestens *Lesen* und *Erstellen* teilen.
+3. Alle anderen Installationen nehmen die geteilte Tabelle automatisch, weil sie immer die **älteste** beschreibbare Tabelle mit diesem Namen verwenden. Einträge, die sie vorher in einer eigenen Tabelle gespeichert haben, werden ohne Duplikate in die geteilte hochgeladen. Ihre alten Tabellen können danach gelöscht werden.
+
+Das Fenster zeigt an, wessen Tabelle verwendet wird („geteilt von …“).
+
 ## 💻 Benutzung
 
 DS9490R einstecken, den iButton-Schlüssel auf die Lesefassung legen und starten:
@@ -89,7 +98,7 @@ uv run python tray_app.py
 Es zeigt den Status des Runners und ein Live-Log, und man kann den Runner pausieren/fortsetzen und sich bei Nextcloud anmelden. tkinter unterstützt keinen System-Tray; beim Schließen wird das Fenster daher in die Taskleiste minimiert. Beenden mit **Quit**. Auf minimalen Linux-Installationen ist eventuell `sudo apt install python3-tk` nötig. Das Fenster folgt der Systemsprache (Deutsch oder Englisch); mit `UI_LANGUAGE=de` oder `en` in der `.env` lässt sich das festlegen.
 
 ### Makefile-Kurzbefehle
-`make` listet alle Ziele auf. Die wichtigsten sind `make sync`, `make run`, `make build`, `make cloud-sync` und `make backup-db`. `make build` sichert `.env` und Datenbank der gebauten App und stellt sie danach automatisch wieder her. PyInstaller kann nicht cross-kompilieren, daher `make build-windows` unter Windows in Git Bash oder MSYS2 ausführen.
+`make` listet alle Ziele auf. Die wichtigsten sind `make sync`, `make run`, `make lint`, `make build`, `make cloud-sync` und `make backup-db`. `make lint` prüft den Code mit [ruff](https://docs.astral.sh/ruff/), `make format` korrigiert und formatiert ihn; die CI führt dieselbe Prüfung aus. `make build` sichert `.env` und Datenbank der gebauten App und stellt sie danach automatisch wieder her. PyInstaller kann nicht cross-kompilieren, daher `make build-windows` unter Windows in Git Bash oder MSYS2 ausführen.
 
 ### Eigenständiger Build (PyInstaller)
 ```bash
@@ -115,7 +124,7 @@ Für Windows gibt es zusätzlich einen MSI-Installer (`FluidTrack-Mini-windows.m
 3. Alle 5 Sekunden prüft die Schleife den 1-Wire-Bus auf eine DS1996-ROM-ID (Familie `0x0c`) und ignoriert andere Gerätefamilien (z. B. einen DS1420-Identifikationschip).
 4. Bei Erkennung: Der gesamte 8192 Byte große Schlüsselspeicher wird direkt per USB gelesen (`ds9490_direct.py`), alle 255 Ringpuffer-Plätze werden ausgewertet, und jeder Tankvorgang erhält einen Hash zur Duplikaterkennung.
 5. Neue (noch unbekannte) Tankvorgänge werden lokal gespeichert und, falls Nextcloud eingerichtet ist, hochgeladen.
-6. Ist `DELETE_KEY_AFTER_SYNC=true` **und** jeder Tankvorgang auf dem Schlüssel nachweislich vollständig verarbeitet, wird der Transaktionsbereich gelöscht (danach durch erneutes Lesen geprüft). Der Header des Schlüssels (Firmware-Version, Stationsnummer) bleibt erhalten.
+6. Ist `DELETE_KEY_AFTER_SYNC=true` **und** jeder Tankvorgang auf dem Schlüssel nachweislich vollständig verarbeitet, wird der Schlüssel wie mit der PIUSI-Software gelöscht und danach durch erneutes Lesen geprüft. Firmware-Version und Stationsnummer bleiben erhalten.
 
 ## 📊 Datenzuordnung
 
@@ -138,6 +147,8 @@ Das Format auf dem Schlüssel ist vom Hersteller nicht dokumentiert und wurde wi
 
 **Wichtigste Erkenntnisse:**
 - Der Speicher ist ein **Ringpuffer mit 255 Plätzen** (32 Byte/Platz) nach einem 16-Byte-Header (2 unbekannte Bytes + nullterminierter Firmware-Versionsstring + 6-stellige Stationsnummer).
+- Header-Byte 8 ist der **Schreibzeiger**: der Platz, den die Zapfsäule als Nächstes beschreibt (z. B. `0x0E`, wenn der neueste Eintrag in Platz 13 liegt).
+- **Löschen** (wie die PIUSI-SelfService-Software, an einem echten Schlüssel geprüft): Die Namenshälfte jedes Eintrags wird auf `0xFF` gesetzt und der Schreibzeiger auf `0`. Die Datenhälften (Liter/Datum/Uhrzeit) bleiben auf dem Schlüssel, ein Platz ohne Namen zählt aber nicht mehr als Eintrag. PIUSI lässt den Namen des letzten Platzes (`0x1FF0`) stehen. FluidTrack-Mini löscht ihn mit, damit ein gelöschter Schlüssel leer gelesen wird.
 - Ist der Puffer voll, werden die ältesten Einträge zuerst überschrieben – die physische Adressreihenfolge ist über den gesamten Puffer **nicht** chronologisch (sie beginnt bei jedem Umlauf abschnittsweise neu).
 - Innerhalb eines 32-Byte-Platzes gehört die „Namens“-Hälfte tatsächlich zur **Datenhälfte des vorherigen Platzes**, nicht zur eigenen – ein Versatz um eins, der erst beim Abgleich mit echten Exporten auffiel.
 - Liter sind als **drei aufeinanderfolgende BCD-Bytes kodiert, zu einer 6-stelligen Zahl zusammengesetzt und durch 100 geteilt** (z. B. `00 45 80` → `"004580"` → `45.80` L) – keine einfache Binärzahl.

@@ -68,17 +68,95 @@ class FuelDatabase:
                 # placeholder hash so the UNIQUE index doesn't reject them, and
                 # key_id="LEGACY" marks them as not coming from a real key read.
                 sample_rows = [
-                    (1, "2020-01-10T07:35:00", "100001", 1.94, "1", "", 0, 0, 0, 0, "LEGACY", "legacy-0001"),
-                    (1, "2020-01-10T07:35:00", "100001", 2.04, "1", "", 0, 0, 0, 0, "LEGACY", "legacy-0002"),
-                    (1, "2020-01-10T09:42:00", "100001", 3.06, "2", "", 0, 0, 0, 0, "LEGACY", "legacy-0003"),
-                    (1, "2020-01-10T09:42:00", "100001", 3.33, "2", "", 0, 0, 0, 0, "LEGACY", "legacy-0004"),
-                    (1, "2020-01-12T08:06:00", "100001", 3.01, "2", "", 0, 0, 0, 0, "LEGACY", "legacy-0005"),
-                    (1, "2020-02-01T09:56:00", "100001", 190.11, "AB.CD.1234", "", 0, 0, 0, 0, "LEGACY", "legacy-0006"),
+                    (
+                        1,
+                        "2020-01-10T07:35:00",
+                        "100001",
+                        1.94,
+                        "1",
+                        "",
+                        0,
+                        0,
+                        0,
+                        0,
+                        "LEGACY",
+                        "legacy-0001",
+                    ),
+                    (
+                        1,
+                        "2020-01-10T07:35:00",
+                        "100001",
+                        2.04,
+                        "1",
+                        "",
+                        0,
+                        0,
+                        0,
+                        0,
+                        "LEGACY",
+                        "legacy-0002",
+                    ),
+                    (
+                        1,
+                        "2020-01-10T09:42:00",
+                        "100001",
+                        3.06,
+                        "2",
+                        "",
+                        0,
+                        0,
+                        0,
+                        0,
+                        "LEGACY",
+                        "legacy-0003",
+                    ),
+                    (
+                        1,
+                        "2020-01-10T09:42:00",
+                        "100001",
+                        3.33,
+                        "2",
+                        "",
+                        0,
+                        0,
+                        0,
+                        0,
+                        "LEGACY",
+                        "legacy-0004",
+                    ),
+                    (
+                        1,
+                        "2020-01-12T08:06:00",
+                        "100001",
+                        3.01,
+                        "2",
+                        "",
+                        0,
+                        0,
+                        0,
+                        0,
+                        "LEGACY",
+                        "legacy-0005",
+                    ),
+                    (
+                        1,
+                        "2020-02-01T09:56:00",
+                        "100001",
+                        190.11,
+                        "AB.CD.1234",
+                        "",
+                        0,
+                        0,
+                        0,
+                        0,
+                        "LEGACY",
+                        "legacy-0006",
+                    ),
                 ]
                 cursor.executemany(
                     f"""INSERT INTO {self.table_name}
-                    (station_number, timestamp, serial_number, liters, operator, registration_number,
-                     odometer, printed, sent, refused, key_id, hash)
+                    (station_number, timestamp, serial_number, liters, operator,
+                     registration_number, odometer, printed, sent, refused, key_id, hash)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     sample_rows,
                 )
@@ -106,8 +184,11 @@ class FuelDatabase:
         finally:
             conn.close()
 
-    def insert_transaction(self, record_hash, key_id, station, timestamp, liters, operator, vehicle):
-        """Inserts a freshly parsed iButton transaction. Returns the new row's id, or None on failure.
+    def insert_transaction(
+        self, record_hash, key_id, station, timestamp, liters, operator, vehicle
+    ):
+        """Inserts a freshly parsed iButton transaction.
+        Returns the new row's id, or None on failure.
 
         Mapping onto the existing columns:
           serial_number        <- station (PIUSI station serial number, e.g. '100001')
@@ -130,7 +211,7 @@ class FuelDatabase:
                     liters,
                     str(operator),
                     vehicle,
-                    0,  # odometer: not present in the iButton format (see reverse-engineering notes)
+                    0,  # odometer: not in the iButton format (see reverse-engineering notes)
                     0,  # printed
                     0,  # sent (set via mark_as_synced once the Nextcloud upload succeeds)
                     0,  # refused
@@ -173,9 +254,7 @@ class FuelDatabase:
         try:
             conn = self._connect()
             cursor = conn.cursor()
-            cursor.execute(
-                f"UPDATE {self.table_name} SET sent = 1 WHERE id = ?", (record_id,)
-            )
+            cursor.execute(f"UPDATE {self.table_name} SET sent = 1 WHERE id = ?", (record_id,))
             conn.commit()
             return True
         except Exception as e:

@@ -200,9 +200,7 @@ class DS9490:
         self._claimed = False
 
         try:
-            dev = usb.core.find(
-                idVendor=VENDOR_ID, idProduct=PRODUCT_ID, backend=_usb_backend()
-            )
+            dev = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID, backend=_usb_backend())
         except usb.core.NoBackendError as e:
             raise DS2490Error(
                 "No libusb backend available. "
@@ -284,8 +282,10 @@ class DS9490:
         def endpoint(direction, ep_type):
             return usb.util.find_descriptor(
                 intf,
-                custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == direction
-                and usb.util.endpoint_type(e.bmAttributes) == ep_type,
+                custom_match=lambda e: (
+                    usb.util.endpoint_direction(e.bEndpointAddress) == direction
+                    and usb.util.endpoint_type(e.bmAttributes) == ep_type
+                ),
             )
 
         self.ep_status = endpoint(usb.util.ENDPOINT_IN, usb.util.ENDPOINT_TYPE_INTR)
@@ -339,7 +339,12 @@ class DS9490:
         self._usb(
             "control transfer",
             self.dev.ctrl_transfer,
-            VENDOR_REQUEST_TYPE, cmd_type, value, index, None, timeout=USB_TIMEOUT_MS,
+            VENDOR_REQUEST_TYPE,
+            cmd_type,
+            value,
+            index,
+            None,
+            timeout=USB_TIMEOUT_MS,
         )
 
     def _reset_device(self):
@@ -351,7 +356,10 @@ class DS9490:
         return bytes(
             self._usb(
                 "status read",
-                self.dev.read, self.ep_status.bEndpointAddress, size, timeout=USB_TIMEOUT_MS,
+                self.dev.read,
+                self.ep_status.bEndpointAddress,
+                size,
+                timeout=USB_TIMEOUT_MS,
             )
         )
 
@@ -382,7 +390,11 @@ class DS9490:
             missing = length - len(result)
             size = -(-missing // packet) * packet
             chunk = self._usb(
-                "bulk read", self.dev.read, self.ep_in.bEndpointAddress, size, timeout=USB_TIMEOUT_MS
+                "bulk read",
+                self.dev.read,
+                self.ep_in.bEndpointAddress,
+                size,
+                timeout=USB_TIMEOUT_MS,
             )
             result.extend(chunk)
             if len(result) < length and time.monotonic() > deadline:
@@ -568,6 +580,9 @@ CMD_WRITE_SCRATCHPAD = 0x0F
 CMD_READ_SCRATCHPAD = 0xAA
 CMD_COPY_SCRATCHPAD = 0x55
 
+PAGE_SIZE = 32  # DS1996 NV-RAM page = scratchpad size
+ES_FLAGS_MASK = 0x60  # E/S byte: OF (overflow, bit 6) | PF (partial byte, bit 5)
+
 
 def write_scratchpad(ds: DS9490, rom_id: str, start_addr: int, data: bytes):
     """Writes up to 32 bytes into the scratchpad buffer (NOT directly into NV-RAM)."""
@@ -582,14 +597,18 @@ def write_scratchpad(ds: DS9490, rom_id: str, start_addr: int, data: bytes):
 
 
 def read_scratchpad(ds: DS9490, rom_id: str):
-    """Reads back TA1/TA2/E-S byte + scratchpad content -- used for verification before commit."""
+    """Reads back TA1/TA2/E-S byte + scratchpad content -- used for verification before commit.
+
+    The device returns the scratchpad starting at the target offset (TA1 & 0x1F),
+    not at offset 0, so only the bytes from there up to the ending offset are read."""
     ds.match_rom(rom_id)
     ds.write_byte(CMD_READ_SCRATCHPAD)
     ta1 = ds.read_byte()
     ta2 = ds.read_byte()
     es = ds.read_byte()
+    start_offset = ta1 & 0x1F
     ending_offset = es & 0x1F
-    length = ending_offset + 1
+    length = max(ending_offset - start_offset + 1, 0)
     data = ds.read_block(length)
     return ta1, ta2, es, data
 
@@ -610,13 +629,30 @@ def write_memory_page(ds: DS9490, rom_id: str, start_addr: int, data: bytes):
     Scratchpad (byte-for-byte verification) -> only Copy Scratchpad on an
     exact match. Raises DS2490Error if verification fails (nothing is
     committed in that case -- the NV-RAM remains unchanged).
+
+    The data must not cross a 32-byte page boundary: the scratchpad only
+    covers one page, bytes beyond its end are dropped (OF flag) and the
+    rest of the range would silently stay unwritten.
     """
+    if not data:
+        return
+    if (start_addr % PAGE_SIZE) + len(data) > PAGE_SIZE:
+        raise ValueError(
+            f"Write of {len(data)} bytes at 0x{start_addr:04x} crosses a "
+            f"{PAGE_SIZE}-byte page boundary."
+        )
     write_scratchpad(ds, rom_id, start_addr, data)
     ta1, ta2, es, readback = read_scratchpad(ds, rom_id)
     if (ta1, ta2) != (start_addr & 0xFF, (start_addr >> 8) & 0xFF):
         raise DS2490Error(
             f"Scratchpad target address mismatch: expected 0x{start_addr:04x}, "
             f"got TA1=0x{ta1:02x} TA2=0x{ta2:02x}"
+        )
+    expected_end = (start_addr + len(data) - 1) % PAGE_SIZE
+    if es & ES_FLAGS_MASK or (es & 0x1F) != expected_end:
+        raise DS2490Error(
+            f"Scratchpad E/S byte unexpected: 0x{es:02x} (expected ending "
+            f"offset 0x{expected_end:02x}, no OF/PF flags)"
         )
     if bytes(readback) != bytes(data):
         raise DS2490Error(
@@ -635,25 +671,99 @@ def erase_ds1996_memory(
     progress_callback=None,
 ):
     """
-    Overwrites the given memory range page by page (32 bytes) with fill_byte
-    (default 0xFF, the observed 'blank' state). By default only the record
+    Low-level tool, NOT used by the app (see erase_ds1996_records for the
+    erase that matches the original PIUSI software).
+
+    Overwrites the given memory range page by page (aligned to the 32-byte
+    pages) with fill_byte (default 0xFF, the observed 'blank' state). By default only the record
     area from byte 16 onward is erased -- the 16-byte header (firmware
     version + station number) is preserved.
 
     Aborts immediately on a verification failure (raises DS2490Error), so a
     partially erased/inconsistent state never goes unnoticed.
     """
-    page_size = 32
     offset = start_addr
     end = start_addr + length
-    blank_page = bytes([fill_byte] * page_size)
+    blank_page = bytes([fill_byte] * PAGE_SIZE)
 
     while offset < end:
-        chunk_len = min(page_size, end - offset)
+        # Never cross a page boundary: the default start (16) is mid-page, so
+        # the first chunk is only 16 bytes long, all following ones are aligned.
+        chunk_len = min(PAGE_SIZE - offset % PAGE_SIZE, end - offset)
         write_memory_page(ds, rom_id, offset, blank_page[:chunk_len])
         if progress_callback:
             progress_callback(offset + chunk_len, end)
         offset += chunk_len
+
+
+# --- Key layout (reverse-engineered, see read_raw_blocks) -------------------
+KEY_SIZE = 8192
+HEADER_SIZE = 16
+RECORD_SIZE = 32
+RECORD_SLOTS = 255  # ring buffer: (8192 - 16) // 32
+NAME_SIZE = 16
+# Header byte 8: ring-buffer slot the dispenser writes next (0..254). On a key
+# holding 14 records in slots 0-13 it read 0x0E; erasing resets it to 0.
+HEADER_WRITE_INDEX = 8
+
+
+def record_name_offsets():
+    """Addresses of the name halves: record i keeps its name in the upper half
+    of the NEXT block, i.e. at 0x30 + 32*i (always the upper half of a page)."""
+    return [HEADER_SIZE + RECORD_SIZE * (i + 1) for i in range(RECORD_SLOTS)]
+
+
+def is_key_erased(data: bytes) -> bool:
+    """True if the key is in the erased state: write index 0 and every name
+    half blank (0xFF). The data halves may still hold old values -- without a
+    name they no longer count as records (see scan_records)."""
+    if len(data) < KEY_SIZE or data[HEADER_WRITE_INDEX] != 0:
+        return False
+    return all(
+        all(b == 0xFF for b in data[offset : offset + NAME_SIZE])
+        for offset in record_name_offsets()
+    )
+
+
+def erase_ds1996_records(ds: DS9490, rom_id: str, current: bytes = None, progress_callback=None):
+    """
+    Erases the key the way the PIUSI SelfService software does (determined
+    from a key erased by the original software):
+
+      - every record's name half (16 bytes) is overwritten with 0xFF,
+      - the write index in header byte 8 is reset to 0, so the dispenser
+        starts writing at slot 0 again,
+      - the data halves (liters/date/time) and the rest of the header stay
+        untouched.
+
+    One deliberate difference: the original software leaves the name of the
+    last slot (0x1FF0) in place, so one old record stays readable. It is
+    cleared here as well, so an erased key reads as empty.
+
+    Already blank name halves are skipped (fewer writes, fast retries). The
+    header is written LAST, so an interrupted erase can simply be repeated.
+    Every page write is verified via the scratchpad before it is committed.
+    Returns the number of page writes performed.
+    """
+    if current is None:
+        current = read_ds1996_memory(ds, rom_id, 0, KEY_SIZE)
+    if len(current) < KEY_SIZE:
+        raise ValueError(f"Need the full {KEY_SIZE}-byte memory image, got {len(current)}.")
+
+    blank_name = bytes([0xFF] * NAME_SIZE)
+    todo = [o for o in record_name_offsets() if current[o : o + NAME_SIZE] != blank_name]
+    reset_index = current[HEADER_WRITE_INDEX] != 0
+    total = len(todo) + (1 if reset_index else 0)
+
+    for done, offset in enumerate(todo, 1):
+        write_memory_page(ds, rom_id, offset, blank_name)
+        if progress_callback:
+            progress_callback(done, total)
+    if reset_index:
+        write_memory_page(ds, rom_id, HEADER_WRITE_INDEX, b"\x00")
+        if progress_callback:
+            progress_callback(total, total)
+    return total
 
 
 def hexdump(data: bytes, width: int = 16) -> str:
@@ -786,7 +896,12 @@ def scan_records(data: bytes, header_size: int = 16, block_size: int = 32):
         parsed = parse_data_half(blocks[i]["data_raw"])
         if parsed is None:
             continue
-        parsed["name"] = blocks[i + 1]["name_raw"].decode("ascii", errors="replace").strip()
+        name_raw = blocks[i + 1]["name_raw"]
+        if all(b == 0xFF for b in name_raw):
+            # Blank name half next to a valid data half: leftover of an
+            # incomplete erase, not a real transaction.
+            continue
+        parsed["name"] = name_raw.decode("ascii", errors="replace").strip()
         parsed["offset"] = blocks[i]["offset"]
         records.append(parsed)
     return records
@@ -796,7 +911,9 @@ def print_records_table(records):
     if not records:
         print("[i] No plausible records found (maybe adjust header/block size).")
         return
-    header = f"{'Offset':>8} | {'Name':<16} | {'Date':<10} | {'Time':<5} | {'Liters':>9} | {'Op':>3}"
+    header = (
+        f"{'Offset':>8} | {'Name':<16} | {'Date':<10} | {'Time':<5} | {'Liters':>9} | {'Op':>3}"
+    )
     print(header)
     print("-" * len(header))
     for r in records:
@@ -811,7 +928,8 @@ def main():
         description="Direct USB read of a DS1996 via the DS9490R (pyusb, no kernel/TMEX driver)"
     )
     parser.add_argument(
-        "rom_id", nargs="?",
+        "rom_id",
+        nargs="?",
         help="ROM ID of the key, e.g. 0c-0000000000ab (default: search the bus over USB)",
     )
     parser.add_argument(
@@ -821,11 +939,16 @@ def main():
         "--start", type=lambda x: int(x, 0), default=0, help="Start address (default: 0)"
     )
     parser.add_argument(
-        "--rom-mode", choices=["match", "skip"], default="match",
-        help="'match' (default, recommended) or 'skip' (debugging only, with multiple devices on the bus)"
+        "--rom-mode",
+        choices=["match", "skip"],
+        default="match",
+        help="'match' (default, recommended) or 'skip' "
+        "(debugging only, with multiple devices on the bus)",
     )
     parser.add_argument(
-        "--debug", action="store_true", help="Print presence/echo diagnostics during the ROM handshake"
+        "--debug",
+        action="store_true",
+        help="Print presence/echo diagnostics during the ROM handshake",
     )
     args = parser.parse_args()
 
@@ -840,8 +963,10 @@ def main():
 
     print("[+] Connecting to the DS9490R...")
     with DS9490() as ds:
-        print(f"[+] Reading {args.length} bytes from address 0x{args.start:04x} of {args.rom_id} "
-              f"(rom-mode={args.rom_mode})...")
+        print(
+            f"[+] Reading {args.length} bytes from address 0x{args.start:04x} of {args.rom_id} "
+            f"(rom-mode={args.rom_mode})..."
+        )
         data = read_ds1996_memory(
             ds, args.rom_id, args.start, args.length, rom_mode=args.rom_mode, debug=args.debug
         )

@@ -59,6 +59,12 @@ jobs:
         shell: bash
         run: uv run python -m py_compile src/*.py
 
+      - name: Lint (ruff)
+        if: matrix.name == 'linux'
+        run: |
+          uv run ruff check --output-format=github src tests
+          uv run ruff format --check src tests
+
       - name: Unit tests (USB adapter simulated)
         run: uv run python -m unittest discover -s tests -v
 

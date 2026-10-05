@@ -35,21 +35,40 @@ import sys
 import threading
 import time
 import tkinter as tk
-import webbrowser
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
 import main as runtime
 from i18n import t
-from main import POLL_INTERVAL_SECONDS, initialize, poll_once, set_delete_key_after_sync
+from main import (
+    KEY_ERROR,
+    KEY_IDLE,
+    KEY_PENDING,
+    KEY_READING,
+    KEY_SYNCED,
+    POLL_INTERVAL_SECONDS,
+    AlreadyRunningError,
+    initialize,
+    poll_once,
+    set_delete_key_after_sync,
+    set_upload_listener,
+)
 from nextcloud import NextcloudTablesSync
-from nextcloud_login import poll_for_credentials, start_login_flow, write_env_values
+from nextcloud_login import (
+    NextcloudLoginError,
+    credentials_to_env,
+    normalize_nextcloud_url,
+    open_browser,
+    poll_for_credentials,
+    start_login_flow,
+    write_env_values,
+)
 from paths import ENV_PATH
 
 APP_TITLE = "FluidTrack-Mini"
-COLOR_ACTIVE = "#2ecc71"    # green
+COLOR_ACTIVE = "#2ecc71"  # green
 COLOR_INACTIVE = "#95a5a6"  # grey
-COLOR_BUSY = "#f1c40f"      # amber, shown during login
-COLOR_ERROR = "#e74c3c"     # red, Nextcloud configured but not reachable
+COLOR_BUSY = "#f1c40f"  # amber, shown during login
+COLOR_ERROR = "#e74c3c"  # red, Nextcloud not reachable / key being read
 MAX_LOG_LINES = 500
 UI_POLL_MS = 200
 
@@ -97,11 +116,21 @@ class ControlApp:
         self.runner_active.set()  # start active by default
         self.stop_requested = threading.Event()
         self.login_in_progress = False
+        # (KEY_* state, rom_id) of the key on the reader, reported by poll_once.
+        self.key_state = (KEY_IDLE, None)
 
         self._build_ui()
 
         # --- Core runner state ---
-        self.db, self.cloud, self.nextcloud_enabled = initialize()
+        try:
+            self.db, self.cloud, self.nextcloud_enabled = initialize()
+        except AlreadyRunningError as e:
+            messagebox.showerror(APP_TITLE, t("already_running", error=e), parent=self.root)
+            self.root.destroy()
+            raise SystemExit(1) from None
+        # Quit is disabled while records are uploaded to Nextcloud.
+        self.uploading = False
+        set_upload_listener(lambda busy: self.ui_queue.put(("uploading", busy)))
         self._update_status()
 
         self.worker_thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -118,7 +147,9 @@ class ControlApp:
         top.pack(fill="x")
 
         self.status_canvas = tk.Canvas(top, width=18, height=18, highlightthickness=0)
-        self.status_dot = self.status_canvas.create_oval(2, 2, 16, 16, fill=COLOR_ACTIVE, outline="")
+        self.status_dot = self.status_canvas.create_oval(
+            2, 2, 16, 16, fill=COLOR_ACTIVE, outline=""
+        )
         self.status_canvas.pack(side="left")
 
         self.status_label = ttk.Label(top, text=t("starting"))
@@ -128,7 +159,9 @@ class ControlApp:
         cloud_row.pack(fill="x")
 
         self.cloud_canvas = tk.Canvas(cloud_row, width=18, height=18, highlightthickness=0)
-        self.cloud_dot = self.cloud_canvas.create_oval(2, 2, 16, 16, fill=COLOR_INACTIVE, outline="")
+        self.cloud_dot = self.cloud_canvas.create_oval(
+            2, 2, 16, 16, fill=COLOR_INACTIVE, outline=""
+        )
         self.cloud_canvas.pack(side="left")
 
         self.nextcloud_label = ttk.Label(cloud_row, text=t("nc_prefix") + "...")
@@ -137,15 +170,16 @@ class ControlApp:
         buttons = ttk.Frame(self.root, padding=(10, 4))
         buttons.pack(fill="x")
 
-        self.toggle_button = ttk.Button(buttons, text=t("pause_runner"), command=self._toggle_runner)
+        self.toggle_button = ttk.Button(
+            buttons, text=t("pause_runner"), command=self._toggle_runner
+        )
         self.toggle_button.pack(side="left")
 
-        self.login_button = ttk.Button(
-            buttons, text=t("login"), command=self._on_login_clicked
-        )
+        self.login_button = ttk.Button(buttons, text=t("login"), command=self._on_login_clicked)
         self.login_button.pack(side="left", padx=6)
 
-        ttk.Button(buttons, text=t("quit"), command=self._quit).pack(side="right")
+        self.quit_button = ttk.Button(buttons, text=t("quit"), command=self._quit)
+        self.quit_button.pack(side="right")
 
         options = ttk.Frame(self.root, padding=(10, 2))
         options.pack(fill="x")
@@ -163,8 +197,19 @@ class ControlApp:
         self.log_text.pack(fill="both", expand=True, padx=10, pady=(4, 10))
 
     def _update_status(self, busy_text=None):
+        key_state, rom_id = self.key_state
         if busy_text:
             color, text = COLOR_BUSY, busy_text
+        elif key_state == KEY_READING:
+            color, text = COLOR_ERROR, t("key_reading", rom=rom_id)
+        elif not self.runner_active.is_set():
+            color, text = COLOR_INACTIVE, t("runner_paused")
+        elif key_state == KEY_ERROR:
+            color, text = COLOR_BUSY, t("key_error", rom=rom_id)
+        elif key_state == KEY_PENDING:
+            color, text = COLOR_BUSY, t("key_pending", rom=rom_id)
+        elif key_state == KEY_SYNCED:
+            color, text = COLOR_ACTIVE, t("key_synced", rom=rom_id)
         elif self.runner_active.is_set():
             color, text = COLOR_ACTIVE, t("runner_active", seconds=POLL_INTERVAL_SECONDS)
         else:
@@ -175,6 +220,9 @@ class ControlApp:
             text=t("pause_runner") if self.runner_active.is_set() else t("resume_runner")
         )
         self.login_button.configure(state="disabled" if self.login_in_progress else "normal")
+        # Quitting while the key is read or erased would interrupt the USB access.
+        busy = key_state == KEY_READING or getattr(self, "uploading", False)
+        self.quit_button.configure(state="disabled" if busy else "normal")
         self._update_cloud_status()
 
     def _update_cloud_status(self):
@@ -190,10 +238,11 @@ class ControlApp:
         else:
             color = COLOR_ERROR
         self.cloud_canvas.itemconfigure(self.cloud_dot, fill=color)
-        self.nextcloud_label.configure(text=t("nc_prefix") + cloud.status_text())
-        self.login_button.configure(
-            text=t("relogin") if cloud.connected else t("login")
-        )
+        text = t("nc_prefix") + cloud.status_text()
+        if getattr(self, "uploading", False):
+            text += t("nc_uploading")
+        self.nextcloud_label.configure(text=text)
+        self.login_button.configure(text=t("relogin") if cloud.connected else t("login"))
 
     def _append_log(self, text):
         self.log_text.configure(state="normal")
@@ -215,6 +264,16 @@ class ControlApp:
                     self._append_log(payload)
                 elif kind == "status":
                     self._update_status(busy_text=payload)
+                elif kind == "error":
+                    messagebox.showerror(APP_TITLE, payload, parent=self.root)
+                elif kind == "uploading":
+                    self.uploading = payload
+                    self._update_status()
+                elif kind == "key":
+                    self.key_state = payload
+                    self._update_status()
+                elif kind == "show_url":
+                    self._show_login_link(payload)
         except queue.Empty:
             pass
         # Connection state is changed by the worker thread; mirror it here.
@@ -261,28 +320,62 @@ class ControlApp:
     def _on_login_clicked(self):
         # The URL dialog must run on the main thread; the network/browser
         # wait runs in a worker thread so the window stays responsive.
-        url = simpledialog.askstring(APP_TITLE, t("enter_url"), parent=self.root)
-        if not url:
+        # Pre-fill the current server, so switching only means editing it.
+        url = simpledialog.askstring(
+            APP_TITLE,
+            t("enter_url"),
+            initialvalue=os.getenv("NEXTCLOUD_URL", ""),
+            parent=self.root,
+        )
+        if not url or not url.strip():
+            return
+        try:
+            url = normalize_nextcloud_url(url)
+        except NextcloudLoginError as e:
+            messagebox.showerror(APP_TITLE, t("login_failed", error=e), parent=self.root)
             return
         self.login_in_progress = True
         self._update_status(busy_text=t("waiting_login"))
-        threading.Thread(target=self._do_nextcloud_login, args=(url.strip(),), daemon=True).start()
+        threading.Thread(target=self._do_nextcloud_login, args=(url,), daemon=True).start()
+
+    def _show_login_link(self, login_url):
+        """Fallback when no browser could be started: show the link to copy."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(APP_TITLE)
+        dialog.transient(self.root)
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=t("browser_failed"), wraplength=420).pack(anchor="w")
+        link = tk.StringVar(value=login_url)
+        entry = ttk.Entry(frame, textvariable=link, width=60, state="readonly")
+        entry.pack(fill="x", pady=8)
+        entry.focus_set()
+        entry.select_range(0, "end")
+
+        def copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(login_url)
+            copy_button.configure(text=t("link_copied"))
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x")
+        copy_button = ttk.Button(buttons, text=t("copy_link"), command=copy)
+        copy_button.pack(side="left")
+        ttk.Button(buttons, text=t("close"), command=dialog.destroy).pack(side="right")
 
     def _do_nextcloud_login(self, url):
-        print("[ui] Opening your browser to log in to Nextcloud...")
+        print(f"[ui] Starting Nextcloud login for {url} ...")
         try:
             login_url, poll_token, poll_endpoint = start_login_flow(url)
-            webbrowser.open(login_url)
+            print(f"[ui] Login page: {login_url}")
+            if not open_browser(login_url):
+                print("[!] No browser could be opened -- showing the link instead.")
+                self.ui_queue.put(("show_url", login_url))
             credentials = poll_for_credentials(poll_endpoint, poll_token)
 
-            write_env_values(
-                ENV_PATH,
-                {
-                    "NEXTCLOUD_URL": credentials["server"],
-                    "NEXTCLOUD_USER": credentials["loginName"],
-                    "NEXTCLOUD_APP_TOKEN": credentials["appPassword"],
-                },
-            )
+            # Also clears NEXTCLOUD_TABLE_ID: an ID from the previous server
+            # must never be used on the new one.
+            write_env_values(ENV_PATH, credentials_to_env(credentials))
 
             # Reload the Nextcloud client so the new credentials take effect
             # immediately, without restarting the whole application.
@@ -295,8 +388,12 @@ class ControlApp:
             self.nextcloud_enabled = cloud.is_configured()
 
             print(f"[ui] Logged in to Nextcloud as {credentials['loginName']}.")
+        except TimeoutError:
+            print("[!] Nextcloud login timed out.")
+            self.ui_queue.put(("error", t("login_failed", error=t("login_timeout"))))
         except Exception as e:
             print(f"[!] Nextcloud login failed: {e}")
+            self.ui_queue.put(("error", t("login_failed", error=e)))
         finally:
             self.login_in_progress = False
             self.ui_queue.put(("status", None))
@@ -306,7 +403,13 @@ class ControlApp:
         # to the taskbar and keeps the runner going.
         self.root.iconify()
 
+    def _on_key_state(self, state, rom_id):
+        """Called by poll_once in the worker thread -- hand over to the UI thread."""
+        self.ui_queue.put(("key", (state, rom_id)))
+
     def _quit(self):
+        if self.key_state[0] == KEY_READING or self.uploading:
+            return  # button is disabled; guard against keyboard activation
         self.stop_requested.set()
         self.root.destroy()
 
@@ -318,7 +421,9 @@ class ControlApp:
         while not self.stop_requested.is_set():
             if self.runner_active.is_set():
                 try:
-                    poll_once(self.db, self.cloud, self.nextcloud_enabled)
+                    poll_once(
+                        self.db, self.cloud, self.nextcloud_enabled, on_key_state=self._on_key_state
+                    )
                 except Exception as e:
                     print(f"[!] Error during poll cycle: {e}")
             # Sleep in small steps so Quit/toggle react quickly instead of

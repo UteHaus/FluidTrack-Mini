@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import os
 import platform
@@ -12,8 +13,9 @@ from database import FuelDatabase
 from ds9490_direct import (
     DS9490,
     DS2490Error,
-    erase_ds1996_memory,
+    erase_ds1996_records,
     find_ds1996_rom_id_usb,
+    is_key_erased,
     read_ds1996_memory,
     scan_records,
 )
@@ -74,7 +76,7 @@ def _find_ds1996_rom_id_sysfs():
     if not os.path.exists(slaves_file):
         return False, None
 
-    with open(slaves_file, "r") as f:
+    with open(slaves_file) as f:
         candidates = [line.strip() for line in f if line.strip() and "not found" not in line]
 
     for rom_id in candidates:
@@ -182,6 +184,70 @@ def read_all_transactions(rom_id):
     return transactions
 
 
+# --- Upload activity, reported to the GUI (Quit is disabled meanwhile) --------
+_upload_listener = None
+
+
+def set_upload_listener(callback):
+    """callback(busy) is called with True when uploads to Nextcloud start and
+    with False when they are finished (also after errors)."""
+    global _upload_listener
+    _upload_listener = callback
+
+
+def _emit_upload(busy):
+    if _upload_listener is not None:
+        try:
+            _upload_listener(busy)
+        except Exception as e:
+            print(f"[!] Upload listener failed: {e}")
+
+
+@contextlib.contextmanager
+def _uploading(active=True):
+    if not active:
+        yield
+        return
+    _emit_upload(True)
+    try:
+        yield
+    finally:
+        _emit_upload(False)
+
+
+# --- Single instance per database --------------------------------------------
+class AlreadyRunningError(RuntimeError):
+    pass
+
+
+_instance_lock = None
+
+
+def acquire_instance_lock(db_path):
+    """Allows only ONE running FluidTrack-Mini per database. Two instances
+    would compare and upload the same records at the same time and create
+    duplicate rows in Nextcloud. The OS releases the lock automatically when
+    the process ends, even after a crash."""
+    lock_file = open(db_path + ".lock", "a+")  # noqa: SIM115 -- kept open on purpose
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        lock_file.close()
+        raise AlreadyRunningError(
+            f"FluidTrack-Mini is already running with the database {db_path}. "
+            "Close the other instance first."
+        ) from e
+    return lock_file
+
+
 def initialize():
     """
     One-time setup: creates the DB/Nextcloud clients, initializes the local
@@ -189,9 +255,14 @@ def initialize():
     (db, cloud, nextcloud_enabled) so both the CLI entry point and other
     front-ends (e.g. a tray app) can reuse the same setup logic.
     """
-    print(
-        f"[+] Initializing FluidTrack-Mini runtime environment on {platform.system()}..."
-    )
+    global _instance_lock
+    print(f"[+] Initializing FluidTrack-Mini runtime environment on {platform.system()}...")
+
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    if _instance_lock is None:
+        _instance_lock = acquire_instance_lock(DB_PATH)
 
     db = FuelDatabase(DB_PATH, DB_TABLE)
     cloud = NextcloudTablesSync()
@@ -203,8 +274,10 @@ def initialize():
     if nextcloud_enabled:
         print("[C] Nextcloud sync is configured and active.")
     else:
-        print("[i] Nextcloud is not configured -- sync will be skipped, "
-              "transactions are only stored locally in SQLite.")
+        print(
+            "[i] Nextcloud is not configured -- sync will be skipped, "
+            "transactions are only stored locally in SQLite."
+        )
 
     return db, cloud, nextcloud_enabled
 
@@ -237,20 +310,39 @@ def sync_pending_transactions(db, cloud):
         return
 
     print(f"[C] Retrying Nextcloud upload for {len(pending)} pending transaction(s)...")
-    synced = 0
-    for record_id, station, timestamp, liters, vehicle, key_id, record_hash in pending:
-        if not cloud.upload_row(
-            station=station,
-            timestamp=timestamp,
-            liters=liters,
-            operator=vehicle,
-            key_id=key_id,
-            record_hash=record_hash,
-        ):
-            break  # server still unreachable/broken -- try again next interval
-        db.mark_as_synced(record_id)
-        synced += 1
+    in_cloud = _hashes_in_nextcloud(cloud)
+    with _uploading():
+        synced = 0
+        for record_id, station, timestamp, liters, vehicle, key_id, record_hash in pending:
+            if record_hash in in_cloud:
+                db.mark_as_synced(record_id)  # uploaded by another installation
+                synced += 1
+                continue
+            if not cloud.upload_row(
+                station=station,
+                timestamp=timestamp,
+                liters=liters,
+                operator=vehicle,
+                key_id=key_id,
+                record_hash=record_hash,
+            ):
+                break  # server still unreachable/broken -- try again next interval
+            db.mark_as_synced(record_id)
+            synced += 1
     print(f"[C] {synced}/{len(pending)} pending transaction(s) synced.")
+
+
+def _hashes_in_nextcloud(cloud):
+    """Hashes already in the Nextcloud table -- other installations may share
+    the table and may have uploaded the same transactions already. Returns an
+    empty set if the table can't be read (upload then proceeds as usual)."""
+    if not cloud.is_ready():
+        return set()
+    try:
+        return cloud.get_uploaded_hashes()
+    except Exception as e:
+        print(f"[!] Could not read existing rows from Nextcloud: {e}")
+        return set()
 
 
 def reconcile_with_nextcloud(db, cloud):
@@ -276,65 +368,59 @@ def reconcile_with_nextcloud(db, cloud):
         f"local transaction(s) already in Nextcloud, {len(missing)} to upload."
     )
 
-    synced = 0
-    for record_id, record_hash, station, timestamp, liters, vehicle, key_id, _ in missing:
-        if not cloud.upload_row(
-            station=station,
-            timestamp=timestamp,
-            liters=liters,
-            operator=vehicle,
-            key_id=key_id,
-            record_hash=record_hash,
-        ):
-            print(f"[!] Upload stopped after {synced}/{len(missing)}, will retry later.")
-            return
-        db.mark_as_synced(record_id)
-        synced += 1
-        if synced % 50 == 0:
-            print(f"[C] {synced}/{len(missing)} uploaded...")
+    with _uploading(active=bool(missing)):
+        synced = 0
+        for record_id, record_hash, station, timestamp, liters, vehicle, key_id, _ in missing:
+            if not cloud.upload_row(
+                station=station,
+                timestamp=timestamp,
+                liters=liters,
+                operator=vehicle,
+                key_id=key_id,
+                record_hash=record_hash,
+            ):
+                print(f"[!] Upload stopped after {synced}/{len(missing)}, will retry later.")
+                return
+            db.mark_as_synced(record_id)
+            synced += 1
+            if synced % 50 == 0:
+                print(f"[C] {synced}/{len(missing)} uploaded...")
 
     if missing:
         print(f"[C] {synced} transaction(s) uploaded to Nextcloud.")
     cloud.reconciled = True
 
 
-def poll_once(db, cloud, nextcloud_enabled):
-    """
-    Runs exactly ONE detection/processing cycle: checks for a key, reads and
-    parses its transactions if present, stores/syncs new ones, and performs
-    the optional erase. Contains no sleep/looping -- callers (CLI loop, or a
-    tray app's worker thread) are responsible for the polling interval.
-    """
-    if nextcloud_enabled:
-        sync_pending_transactions(db, cloud)
+# --- Key state, reported to the GUI via poll_once(on_key_state=...) ----------
+KEY_IDLE = "idle"  # no key on the reader
+KEY_READING = "reading"  # key is being read/erased -- do not remove it
+KEY_SYNCED = "synced"  # key processed, every record on it is synced
+KEY_PENDING = "pending"  # key processed, stored locally, Nextcloud upload pending
+KEY_ERROR = "error"  # reading failed, retried in the next cycle
 
-    rom_id = find_ds1996_rom_id()
+# The key that is still on the reader and was already processed completely:
+# {"rom_id", "hashes", "erase_attempted"}. A key is read once per placement --
+# re-reading it every cycle (~4 s each) would only repeat the same work.
+_key_on_reader = None
 
-    if not rom_id:
-        print("[-] Hardware polling: no DS1996 key (family 0c-) detected on the bus.")
-        return
 
-    print(f"[K] Key detected: {rom_id}")
+def _notify(on_key_state, state, rom_id):
+    if on_key_state is not None:
+        try:
+            on_key_state(state, rom_id)
+        except Exception as e:
+            print(f"[!] Key state callback failed: {e}")
 
-    try:
-        transactions = read_all_transactions(rom_id)
-    except DS2490Error as e:
-        print(f"[!] USB read error: {e}")
-        transactions = []
 
-    if not transactions:
-        print("[+] No valid transactions found on the key.")
-        return
-
+def _store_and_upload(db, cloud, nextcloud_enabled, transactions):
+    """Stores new transactions locally and uploads them to Nextcloud."""
     new_count = 0
+    in_cloud = None  # fetched lazily, once per cycle, only if there is something new
     for tx in transactions:
         if db.record_exists(tx["hash"]):
             continue  # already known (DB or a previous read) -> skip
 
-        print(
-            f"[N] New transaction -> {tx['vehicle']} | "
-            f"{tx['timestamp']} | {tx['liters']:.2f} L"
-        )
+        print(f"[N] New transaction -> {tx['vehicle']} | {tx['timestamp']} | {tx['liters']:.2f} L")
 
         record_id = db.insert_transaction(
             record_hash=tx["hash"],
@@ -351,6 +437,12 @@ def poll_once(db, cloud, nextcloud_enabled):
             continue
 
         if nextcloud_enabled:
+            if in_cloud is None:
+                in_cloud = _hashes_in_nextcloud(cloud)
+            if tx["hash"] in in_cloud:
+                db.mark_as_synced(record_id)
+                print("    [C] Already in Nextcloud (uploaded by another installation).")
+                continue
             uploaded = cloud.upload_row(
                 station=tx["station"],
                 timestamp=tx["timestamp"],
@@ -377,43 +469,129 @@ def poll_once(db, cloud, nextcloud_enabled):
     else:
         print(f"[+] {new_count} new transaction(s) processed.")
 
-    # --- Optional key erasure (only if enabled via .env) ---
-    if DELETE_KEY_AFTER_SYNC:
-        all_confirmed_synced = all(db.is_synced(tx["hash"]) for tx in transactions)
-        if not all_confirmed_synced:
+
+def _erase_key(rom_id):
+    """Erases the key (same procedure as the PIUSI software) and verifies it.
+    Returns True only if the key reads back as fully erased."""
+    print(
+        "[E] DELETE_KEY_AFTER_SYNC is enabled and all records are "
+        "confirmed synced -- erasing key memory..."
+    )
+    try:
+        with DS9490() as ds:
+            # Same procedure as the PIUSI software: blank all record
+            # names and reset the write index (header byte 8).
+            writes = erase_ds1996_records(ds, rom_id)
+
+            # Safety verification: re-read the whole key.
+            verify_data = read_ds1996_memory(ds, rom_id, start_addr=0, length=8192)
+        remaining = scan_records(verify_data)
+        if remaining or not is_key_erased(verify_data):
             print(
-                "[!] Erase skipped: not all records on the key are "
-                "confirmed as synced (sent=1)."
+                f"[!] WARNING: key is not fully erased ({len(remaining)} record(s) still readable)!"
             )
         else:
-            print(
-                "[E] DELETE_KEY_AFTER_SYNC is enabled and all records are "
-                "confirmed synced -- erasing key memory..."
-            )
-            try:
-                with DS9490() as ds:
-                    erase_ds1996_memory(ds, rom_id)
+            print(f"[E] Key erased and verified ({writes} page write(s)).")
+            return True
+    except DS2490Error as e:
+        print(f"[!] Error while erasing the key: {e}")
+    return False
 
-                    # Safety verification: after erasing, scan_records() should
-                    # no longer find anything.
-                    verify_data = read_ds1996_memory(
-                        ds, rom_id, start_addr=0, length=8192
-                    )
-                remaining = scan_records(verify_data)
-                if remaining:
-                    print(
-                        f"[!] WARNING: {len(remaining)} record(s) were "
-                        f"still found after erasing!"
-                    )
-                else:
-                    print("[E] Key successfully erased and verified (blank).")
-            except DS2490Error as e:
-                print(f"[!] Error while erasing the key: {e}")
+
+def poll_once(db, cloud, nextcloud_enabled, on_key_state=None):
+    """
+    Runs exactly ONE detection/processing cycle: checks for a key, reads and
+    parses its transactions if present, stores/syncs new ones, and performs
+    the optional erase. Contains no sleep/looping -- callers (CLI loop, or a
+    tray app's worker thread) are responsible for the polling interval.
+
+    on_key_state(state, rom_id), if given, receives the KEY_* states, e.g.
+    to show in a GUI that the key must not be removed right now.
+    """
+    global _key_on_reader
+    if nextcloud_enabled:
+        sync_pending_transactions(db, cloud)
+
+    rom_id = find_ds1996_rom_id()
+
+    if not rom_id:
+        if _key_on_reader is not None:
+            print("[K] Key removed.")
+            _key_on_reader = None
+            _notify(on_key_state, KEY_IDLE, None)
+        print("[-] Hardware polling: no DS1996 key (family 0c-) detected on the bus.")
+        return
+
+    known = _key_on_reader if _key_on_reader and _key_on_reader["rom_id"] == rom_id else None
+    if known is not None:
+        # Same key still on the reader: no re-read. Only finish what had to
+        # wait for the Nextcloud sync (the erase).
+        all_synced = all(db.is_synced(h) for h in known["hashes"])
+        if (
+            all_synced
+            and DELETE_KEY_AFTER_SYNC
+            and known["hashes"]
+            and not known["erase_attempted"]
+        ):
+            known["erase_attempted"] = True
+            _notify(on_key_state, KEY_READING, rom_id)
+            _erase_key(rom_id)
+        _notify(on_key_state, KEY_SYNCED if all_synced else KEY_PENDING, rom_id)
+        return
+
+    print(f"[K] Key detected: {rom_id}")
+    _notify(on_key_state, KEY_READING, rom_id)
+
+    try:
+        transactions = read_all_transactions(rom_id)
+    except DS2490Error as e:
+        print(f"[!] USB read error: {e}")
+        _notify(on_key_state, KEY_ERROR, rom_id)
+        return  # not remembered -> read again in the next cycle
+
+    if transactions:
+        with _uploading(active=nextcloud_enabled):
+            _store_and_upload(db, cloud, nextcloud_enabled, transactions)
+    else:
+        print("[+] No valid transactions found on the key.")
+
+    hashes = [tx["hash"] for tx in transactions]
+    all_synced = all(db.is_synced(h) for h in hashes)
+    erase_attempted = False
+    # --- Optional key erasure (only if enabled) ---
+    if DELETE_KEY_AFTER_SYNC and transactions:
+        if all_synced:
+            erase_attempted = True
+            _erase_key(rom_id)
+        else:
+            print("[!] Erase postponed: not all records on the key are synced yet.")
+
+    _key_on_reader = {"rom_id": rom_id, "hashes": hashes, "erase_attempted": erase_attempted}
+    _notify(on_key_state, KEY_SYNCED if all_synced else KEY_PENDING, rom_id)
+
+
+def run_cloud_sync():
+    """One-off: compare the local DB with Nextcloud and upload what is missing
+    (used by `make cloud-sync`). Returns a process exit code."""
+    try:
+        db, cloud, nextcloud_enabled = initialize()
+    except AlreadyRunningError as e:
+        print(f"[!] {e}")
+        return 1
+    if not nextcloud_enabled:
+        print("[i] Nextcloud is not configured.")
+        return 0
+    sync_pending_transactions(db, cloud)
+    return 0
 
 
 def main():
     """CLI entry point: initializes once, then polls forever every POLL_INTERVAL_SECONDS."""
-    db, cloud, nextcloud_enabled = initialize()
+    try:
+        db, cloud, nextcloud_enabled = initialize()
+    except AlreadyRunningError as e:
+        print(f"[!] {e}")
+        raise SystemExit(1) from None
 
     print("[R] Operational polling sequence started. Press CTRL+C to terminate.")
 
