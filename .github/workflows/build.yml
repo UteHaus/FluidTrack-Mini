@@ -3,7 +3,7 @@ name: Build binaries
 # Builds the PyInstaller app for Linux and Windows.
 # - Every push/PR to main/master: binaries are attached to the workflow run as artifacts.
 # - Pushing a version tag ("v1.2.3" or "1.2.3"): creates a GitHub Release with
-#   RELEASE_NOTES.md as text and both archives as assets.
+#   RELEASE_NOTES.md as text and both archives plus the Windows MSI as assets.
 # - Publishing a release in the GitHub web UI: both archives are attached to it.
 # - "Run workflow" button in the Actions tab: manual build.
 
@@ -91,11 +91,26 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path dist/FluidTrack-Mini -DestinationPath ${{ matrix.archive }}
 
+      - name: Build MSI installer (Windows)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        # Per-user install, see packaging/windows/FluidTrack-Mini.wxs. The MSI
+        # version comes from pyproject.toml (MSI needs a plain x.y.z number).
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          $version = uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
+          wix build packaging/windows/FluidTrack-Mini.wxs -arch x64 `
+            -d Version=$version -d SourceDir="$PWD\dist\FluidTrack-Mini" `
+            -sice ICE38 -sice ICE64 -sice ICE91 `
+            -o FluidTrack-Mini-windows.msi
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: FluidTrack-Mini-${{ matrix.name }}
-          path: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            FluidTrack-Mini-windows.msi
           if-no-files-found: error
 
   release:

@@ -105,6 +105,8 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 The archives contain no `.env` and no database. Copy `env.example` to `.env` next to the executable.
 
+On Windows there is also an MSI installer (`FluidTrack-Mini-windows.msi`). It installs per user into `%LOCALAPPDATA%\Programs\FluidTrack-Mini` without admin rights and adds a Start menu entry. Put `.env` into that folder. Installing a newer MSI replaces the old version; `.env` and the database are kept, also on uninstall. The MSI is not code-signed, so Windows SmartScreen shows a warning: click *More info → Run anyway*.
+
 ### Execution Flow
 1. `main.py` boots, loads `.env`, and initializes/migrates the local SQLite schema.
 2. If Nextcloud is configured, `nextcloud.py` verifies/creates the target Table; otherwise cloud sync is skipped entirely (this is fully supported, not a fallback/error state).
