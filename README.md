@@ -1,5 +1,7 @@
 # FluidTrack-Mini 🔑⛽
 
+**English** | [Deutsch](README.de.md)
+
 A minimalist, modular open-source tool that reads and parses fueling transactions directly from a **PIUSI iButton fuel key (DS1996)** via a USB 1-Wire adapter, and syncs the logs to a local SQLite database and (optionally) Nextcloud Tables. Developed with ⚡ **uv**.
 
 > ℹ️ This project talks **directly to the physical fuel key over USB**, independent of the original PIUSI "SelfService" Windows software. The on-key data format was fully reverse-engineered (see [Protocol Notes](#-protocol-notes--how-the-format-was-determined) below) and cross-validated against real exported transaction records.
@@ -84,7 +86,7 @@ Instead of the console loop you can start a small tkinter control window:
 ```bash
 uv run python tray_app.py
 ```
-It shows the runner status and a live log, and lets you pause/resume the runner and log in to Nextcloud. tkinter has no system-tray support, so closing the window minimizes it to the taskbar; use **Quit** to exit. On minimal Linux installs you may need `sudo apt install python3-tk`.
+It shows the runner status and a live log, and lets you pause/resume the runner and log in to Nextcloud. tkinter has no system-tray support, so closing the window minimizes it to the taskbar; use **Quit** to exit. On minimal Linux installs you may need `sudo apt install python3-tk`. The window follows the system language (German or English); set `UI_LANGUAGE=de` or `en` in `.env` to override it.
 
 ### Makefile Shortcuts
 Run `make` to list all targets. The most common ones are `make sync`, `make run`, `make build`, `make cloud-sync` and `make backup-db`. `make build` saves and restores the built app's `.env` and database automatically. PyInstaller cannot cross-compile, so run `make build-windows` on Windows from Git Bash or MSYS2.
