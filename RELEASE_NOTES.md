@@ -1,25 +1,21 @@
-# FluidTrack-Mini v0.1.0
-
-First release with standalone builds for Linux and Windows.
+# FluidTrack-Mini v0.2.0
 
 ## New
-- **Desktop window** replaces the tray icon. It shows the runner and Nextcloud status, a live log, and buttons to pause the runner and log in to Nextcloud.
-- **Erase after sync** can be switched on with a checkbox in the window. It asks for confirmation first.
-- **Windows support:** the key is now detected directly over USB, and libusb is bundled. The adapter needs the WinUSB driver (see README).
-- **Standalone builds** for Linux and Windows are built by GitHub Actions and attached to each release.
-- **Makefile** with shortcuts for running, building, testing, and backups. Run `make` to see them all.
+- **Key status in the window:** a red dot while a key is read or erased, green when everything is synced, amber while an upload is pending. *Quit* is disabled while a key is read or records are uploaded.
+- **Several users, one table:** all installations use the oldest writable table with the configured name, including tables shared with them. `NEXTCLOUD_SHARE_WITH` shares the table automatically with a group or users (read and create rows only). Records from a previous own table are moved over without duplicates.
+- **Windows installer (MSI)** in addition to the ZIP archive.
+- **German and English user interface.**
+
+## Changed
+- **Erasing a key now works like the PIUSI software:** all record names are blanked and the write index is reset, so the dispenser starts at slot 0 again. Previously the whole record area was overwritten and the write index was left unchanged.
+- A key that stays on the reader is read once instead of every 5 seconds.
 
 ## Fixed
-- **Nextcloud sync didn't work** because of a wrong API address. The table and its columns are now created automatically, and a missing table ID is resolved on its own.
-- **Records were marked as synced even when the upload failed.** On every start the app now compares the local database with Nextcloud and uploads anything missing, without duplicates.
-- **Match ROM sent the key's ID in the wrong byte order.** Because of this, erasing a key always failed.
-- **Unstable USB connection:** every second connection could time out, and the adapter was not released after use.
+- **Nextcloud login** works with addresses without `https://`, with `http://` redirects, and with URLs copied from the browser. Errors are shown in the window instead of only in the log.
+- **Browser did not open** from the Linux build. If no browser can be started, the login link is shown for copying.
+- **Switching to another Nextcloud** could reuse the table ID of the old server and write into a foreign table.
+- **Duplicate rows** when two instances ran at the same time: only one instance per database can run now, and records already in the table are not uploaded again.
 
 ## Upgrade notes
-- The Nextcloud table gets a new **Hash** column automatically. Existing local records are uploaded on the first start.
-- The built app reads `.env` and `FluidTrack.db` **next to the executable**. Copy `env.example` to `.env` there.
-- On Windows, PIUSI SelfService can't use the adapter while the WinUSB driver is installed.
-
-## Known limitations
-- Windows support has not been tested with real hardware yet.
-- Erasing keys has not been tested with real hardware yet. Try it with a non-critical key first.
+- Erase keys with a non-critical key first and check that the dispenser accepts it.
+- If the source run and the build should share data, set the same absolute `DB_PATH` in both `.env` files.
