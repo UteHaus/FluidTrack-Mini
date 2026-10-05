@@ -102,12 +102,13 @@ jobs:
         shell: pwsh
         # Per-user install, see packaging/windows/FluidTrack-Mini.wxs. The MSI
         # version comes from pyproject.toml (MSI needs a plain x.y.z number).
+        # WiX v4+ `wix build` runs no ICE validation, so there is nothing to
+        # suppress (-sice only exists for the separate `wix msi validate`).
         run: |
           dotnet tool install --global wix --version 5.0.2
           $version = uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
           wix build packaging/windows/FluidTrack-Mini.wxs -arch x64 `
             -d Version=$version -d SourceDir="$PWD\dist\FluidTrack-Mini" `
-            -sice ICE38 -sice ICE64 -sice ICE91 `
             -o FluidTrack-Mini-windows.msi
 
       - name: Upload artifact

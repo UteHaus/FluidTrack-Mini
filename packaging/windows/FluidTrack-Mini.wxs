@@ -3,16 +3,18 @@
 
   Installs into %LOCALAPPDATA%\Programs\FluidTrack-Mini without admin rights.
   The app keeps .env and FluidTrack.db next to the executable (see src/paths.py),
-  so the install folder must be writable by the user -- which is why this is not
+  so the install folder must be writable by the user, which is why this is not
   a per-machine install into Program Files. Both files are created at runtime and
   are not part of the package, so they survive upgrades and uninstalls.
 
   Built in CI (.github/workflows/build.yml):
     wix build packaging/windows/FluidTrack-Mini.wxs -arch x64
       -d Version=<x.y.z> -d SourceDir=<abs path to dist/FluidTrack-Mini>
-      -sice ICE38 -sice ICE64 -sice ICE91 -o FluidTrack-Mini-windows.msi
-  The suppressed ICEs only complain that files in a user profile folder should
-  use registry key paths, which a harvested per-user install can't satisfy.
+      -o FluidTrack-Mini-windows.msi
+  `wix build` (WiX v4+) runs no ICE validation. When validating separately with
+  `wix msi validate`, suppress ICE38, ICE64 and ICE91: they only complain that
+  files in a user profile folder should use registry key paths, which a
+  harvested per-user install can't satisfy.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
