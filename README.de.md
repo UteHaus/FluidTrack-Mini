@@ -85,6 +85,8 @@ Das Fenster zeigt an, wessen Tabelle verwendet wird („geteilt von …“).
 
 ## 💻 Benutzung
 
+> 🔑 **Fahrzeug-Buttons:** Kennzeichen werden an der Zapfsäule zugeordnet, nicht auf dem Button. Siehe [Fahrzeug-Buttons ein Kennzeichen zuordnen](docs/vehicle-keys.de.md).
+
 DS9490R einstecken, den iButton-Schlüssel auf die Lesefassung legen und starten:
 ```bash
 uv run python main.py

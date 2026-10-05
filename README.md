@@ -85,6 +85,8 @@ The window shows whose table is used ("shared by …").
 
 ## 💻 Usage Instructions
 
+> 🔑 **Vehicle keys:** license plates are assigned at the dispenser, not on the key. See [Assigning a License Plate to a Vehicle Key](docs/vehicle-keys.md).
+
 Plug in the DS9490R, rest the iButton key on the reader socket, and run:
 ```bash
 uv run python main.py
