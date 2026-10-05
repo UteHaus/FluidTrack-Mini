@@ -4,6 +4,8 @@ from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
 
+from i18n import t
+
 # Nextcloud Tables REST API v1. Note: this lives under /index.php, NOT under
 # /ocs/v2.php -- the OCS endpoint only exists as ".../api/2" and uses a
 # different request format.
@@ -90,14 +92,14 @@ class NextcloudTablesSync:
     def status_text(self):
         """One-line human-readable connection status for the GUI."""
         if not self.is_configured():
-            return "not configured"
+            return t("nc_not_configured")
         if self.connected is None:
-            return "connecting..."
+            return t("nc_connecting")
         if not self.connected:
-            return f"NOT connected - {(self.last_error or 'unknown error')[:90]}"
-        text = f"connected - table '{self.table_title}' (ID {self.table_id})"
+            return t("nc_not_connected", error=(self.last_error or t("nc_unknown_error"))[:90])
+        text = t("nc_connected", title=self.table_title, table_id=self.table_id)
         if self.last_sync_at:
-            text += f", last upload {self.last_sync_at.strftime('%H:%M:%S')}"
+            text += t("nc_last_upload", time=self.last_sync_at.strftime("%H:%M:%S"))
         return text
 
     def _write_id_to_env(self, new_id):

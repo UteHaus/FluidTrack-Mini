@@ -39,11 +39,11 @@ import webbrowser
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
 import main as runtime
+from i18n import t
 from main import POLL_INTERVAL_SECONDS, initialize, poll_once, set_delete_key_after_sync
 from nextcloud import NextcloudTablesSync
 from nextcloud_login import poll_for_credentials, start_login_flow, write_env_values
 from paths import ENV_PATH
-
 
 APP_TITLE = "FluidTrack-Mini"
 COLOR_ACTIVE = "#2ecc71"    # green
@@ -121,7 +121,7 @@ class ControlApp:
         self.status_dot = self.status_canvas.create_oval(2, 2, 16, 16, fill=COLOR_ACTIVE, outline="")
         self.status_canvas.pack(side="left")
 
-        self.status_label = ttk.Label(top, text="Starting...")
+        self.status_label = ttk.Label(top, text=t("starting"))
         self.status_label.pack(side="left", padx=(6, 0))
 
         cloud_row = ttk.Frame(self.root, padding=(10, 0, 10, 4))
@@ -131,28 +131,28 @@ class ControlApp:
         self.cloud_dot = self.cloud_canvas.create_oval(2, 2, 16, 16, fill=COLOR_INACTIVE, outline="")
         self.cloud_canvas.pack(side="left")
 
-        self.nextcloud_label = ttk.Label(cloud_row, text="Nextcloud: ...")
+        self.nextcloud_label = ttk.Label(cloud_row, text=t("nc_prefix") + "...")
         self.nextcloud_label.pack(side="left", padx=(6, 0), fill="x", expand=True)
 
         buttons = ttk.Frame(self.root, padding=(10, 4))
         buttons.pack(fill="x")
 
-        self.toggle_button = ttk.Button(buttons, text="Pause runner", command=self._toggle_runner)
+        self.toggle_button = ttk.Button(buttons, text=t("pause_runner"), command=self._toggle_runner)
         self.toggle_button.pack(side="left")
 
         self.login_button = ttk.Button(
-            buttons, text="Log in to Nextcloud...", command=self._on_login_clicked
+            buttons, text=t("login"), command=self._on_login_clicked
         )
         self.login_button.pack(side="left", padx=6)
 
-        ttk.Button(buttons, text="Quit", command=self._quit).pack(side="right")
+        ttk.Button(buttons, text=t("quit"), command=self._quit).pack(side="right")
 
         options = ttk.Frame(self.root, padding=(10, 2))
         options.pack(fill="x")
         self.delete_after_sync_var = tk.BooleanVar(value=runtime.DELETE_KEY_AFTER_SYNC)
         ttk.Checkbutton(
             options,
-            text="Erase key automatically after successful sync",
+            text=t("erase_after_sync"),
             variable=self.delete_after_sync_var,
             command=self._on_delete_after_sync_toggled,
         ).pack(side="left")
@@ -166,13 +166,13 @@ class ControlApp:
         if busy_text:
             color, text = COLOR_BUSY, busy_text
         elif self.runner_active.is_set():
-            color, text = COLOR_ACTIVE, f"Runner active (every {POLL_INTERVAL_SECONDS}s)"
+            color, text = COLOR_ACTIVE, t("runner_active", seconds=POLL_INTERVAL_SECONDS)
         else:
-            color, text = COLOR_INACTIVE, "Runner paused"
+            color, text = COLOR_INACTIVE, t("runner_paused")
         self.status_canvas.itemconfigure(self.status_dot, fill=color)
         self.status_label.configure(text=text)
         self.toggle_button.configure(
-            text="Pause runner" if self.runner_active.is_set() else "Resume runner"
+            text=t("pause_runner") if self.runner_active.is_set() else t("resume_runner")
         )
         self.login_button.configure(state="disabled" if self.login_in_progress else "normal")
         self._update_cloud_status()
@@ -190,9 +190,9 @@ class ControlApp:
         else:
             color = COLOR_ERROR
         self.cloud_canvas.itemconfigure(self.cloud_dot, fill=color)
-        self.nextcloud_label.configure(text="Nextcloud: " + cloud.status_text())
+        self.nextcloud_label.configure(text=t("nc_prefix") + cloud.status_text())
         self.login_button.configure(
-            text="Re-login to Nextcloud..." if cloud.connected else "Log in to Nextcloud..."
+            text=t("relogin") if cloud.connected else t("login")
         )
 
     def _append_log(self, text):
@@ -240,11 +240,7 @@ class ControlApp:
         if enabled:
             confirmed = messagebox.askyesno(
                 APP_TITLE,
-                "Erase the key automatically after a successful sync?\n\n"
-                "The key is only erased when EVERY transaction on it is stored "
-                "locally and, if Nextcloud is configured, confirmed uploaded. "
-                "Erased data cannot be restored from the key.\n\n"
-                "Please test this with a non-critical key first.",
+                t("erase_confirm"),
                 icon="warning",
                 parent=self.root,
             )
@@ -265,11 +261,11 @@ class ControlApp:
     def _on_login_clicked(self):
         # The URL dialog must run on the main thread; the network/browser
         # wait runs in a worker thread so the window stays responsive.
-        url = simpledialog.askstring(APP_TITLE, "Enter your Nextcloud URL:", parent=self.root)
+        url = simpledialog.askstring(APP_TITLE, t("enter_url"), parent=self.root)
         if not url:
             return
         self.login_in_progress = True
-        self._update_status(busy_text="Waiting for Nextcloud login in browser...")
+        self._update_status(busy_text=t("waiting_login"))
         threading.Thread(target=self._do_nextcloud_login, args=(url.strip(),), daemon=True).start()
 
     def _do_nextcloud_login(self, url):
