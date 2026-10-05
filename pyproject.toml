@@ -17,5 +17,14 @@ dependencies = [
 dev = [
     "pyinstaller>=6.22.3",
     "pyinstaller-hooks-contrib>=2026.8",
+    "ruff>=0.16.10",
 ]
 
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+# pycodestyle, pyflakes, import order, bugbear, pyupgrade
+select = ["E", "W", "F", "I", "B", "UP"]

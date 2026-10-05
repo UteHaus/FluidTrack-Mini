@@ -18,7 +18,7 @@ Designed for **PIUSI fuel management systems** that identify drivers/vehicles vi
 * **Hash-Based Deduplication:** Every transaction gets a stable content hash, so re-reading the same key (e.g. before it's been synced/erased) never creates duplicate rows locally or in Nextcloud.
 * **Nextcloud is Optional:** Runs perfectly fine with local SQLite only. If Nextcloud credentials are configured, it also auto-provisions the target Table (columns: Station, Timestamp, Liters, Operator, KeyID) and syncs new rows.
 * **Browser-Based Nextcloud Login:** Optional one-time setup (`nextcloud_login.py`) using Nextcloud's official "Login Flow v2" — the same mechanism the Nextcloud Desktop Client uses. No manual app-password generation required.
-* **Optional Key Erasure:** Can automatically wipe the transaction area of the key once *every* record on it is confirmed stored (and, if enabled, synced to Nextcloud) — strictly opt-in via `.env`, off by default.
+* **Optional Key Erasure:** Can automatically erase the key once *every* record on it is confirmed stored (and, if enabled, synced to Nextcloud). The procedure matches the original PIUSI software (see [Protocol Notes](#-protocol-notes--how-the-format-was-determined)). Strictly opt-in, off by default.
 * **License Plate Formatting:** Converts dot-notation vehicle plates (`AB.CD.1234`) found on the key into standard street notation (`AB-CD 1234`); equipment names that don't match the plate pattern (e.g. `FORKLIFT`, `EXCAVATOR-2`) pass through unchanged.
 
 ## 📋 Hardware & Environment Requirements
@@ -74,6 +74,15 @@ cp env.example src/.env
 ```
 When running from source, the app reads `src/.env`. The built app reads the `.env` next to its executable. Every setting is optional. Without Nextcloud credentials the app stores data locally only. `NEXTCLOUD_TABLE_ID` is filled in automatically.
 
+### Several Users, One Table
+Every user logs in with their own Nextcloud account, but all records should land in **one** table:
+
+1. The first user sets up FluidTrack-Mini as usual. The app creates the table.
+2. On that installation, set `NEXTCLOUD_SHARE_WITH` in `.env` to a Nextcloud group or user (e.g. `Fahrer`) and restart. The app shares the table with read and create-rows permission. Alternatively share it in the Nextcloud Tables web UI with at least *read* and *create*.
+3. All other installations pick the shared table automatically, because they always use the **oldest** writable table with that name. Records they stored in their own table before are uploaded into the shared one, without duplicates. Their old tables can be deleted afterwards.
+
+The window shows whose table is used ("shared by …").
+
 ## 💻 Usage Instructions
 
 Plug in the DS9490R, rest the iButton key on the reader socket, and run:
@@ -89,7 +98,7 @@ uv run python tray_app.py
 It shows the runner status and a live log, and lets you pause/resume the runner and log in to Nextcloud. tkinter has no system-tray support, so closing the window minimizes it to the taskbar; use **Quit** to exit. On minimal Linux installs you may need `sudo apt install python3-tk`. The window follows the system language (German or English); set `UI_LANGUAGE=de` or `en` in `.env` to override it.
 
 ### Makefile Shortcuts
-Run `make` to list all targets. The most common ones are `make sync`, `make run`, `make build`, `make cloud-sync` and `make backup-db`. `make build` saves and restores the built app's `.env` and database automatically. PyInstaller cannot cross-compile, so run `make build-windows` on Windows from Git Bash or MSYS2.
+Run `make` to list all targets. The most common ones are `make sync`, `make run`, `make lint`, `make build`, `make cloud-sync` and `make backup-db`. `make lint` checks the code with [ruff](https://docs.astral.sh/ruff/), `make format` fixes and formats it; CI runs the same check. `make build` saves and restores the built app's `.env` and database automatically. PyInstaller cannot cross-compile, so run `make build-windows` on Windows from Git Bash or MSYS2.
 
 ### Standalone Build (PyInstaller)
 ```bash
@@ -115,7 +124,7 @@ On Windows there is also an MSI installer (`FluidTrack-Mini-windows.msi`). It in
 3. Every 5 seconds, the loop checks the 1-Wire bus for a DS1996 (family `0x0c`) ROM ID — ignoring any other device families present (e.g. a DS1420 identification chip).
 4. On detection: the full 8192-byte key memory is read directly over USB (`ds9490_direct.py`), all 255 ring-buffer transaction slots are parsed, and each gets a dedup hash.
 5. New (not-yet-seen) transactions are inserted locally and, if Nextcloud is configured, uploaded.
-6. If `DELETE_KEY_AFTER_SYNC=true` **and** every transaction currently on the key is confirmed fully processed, the transaction area is wiped (verified afterward by re-reading) — the key's header (firmware version, station number) is preserved.
+6. If `DELETE_KEY_AFTER_SYNC=true` **and** every transaction currently on the key is confirmed fully processed, the key is erased like the PIUSI software does it and verified afterward by re-reading. Firmware version and station number are preserved.
 
 ## 📊 Data Mapping Structure
 
@@ -138,6 +147,8 @@ The on-key format is undocumented by the vendor and was reverse-engineered by:
 
 **Key findings:**
 - Memory is a **255-slot ring buffer** (32 bytes/slot) following a 16-byte header (2 unknown bytes + null-terminated firmware version string + 6-digit station number).
+- Header byte 8 is the **write index**: the slot the dispenser writes next (e.g. `0x0E` when the newest record is in slot 13).
+- **Erasing** (as done by the PIUSI SelfService software, verified on a real key): every record's name half is set to `0xFF` and the write index is reset to `0`. The data halves (liters/date/time) stay on the key, but a slot without a name no longer counts as a record. PIUSI leaves the name of the last slot (`0x1FF0`) in place. FluidTrack-Mini clears it too, so an erased key reads as empty.
 - Oldest entries are overwritten first once the buffer is full — physical address order is **not** chronological across the whole buffer (it resets in segments each time the buffer wraps).
 - Within each 32-byte slot, the "name" half actually belongs to the **data half of the previous slot**, not its own — an off-by-one relationship that only became obvious once cross-checked against real transaction exports.
 - Liters are encoded as **three consecutive BCD bytes concatenated into a 6-digit number, divided by 100** (e.g. `00 45 80` → `"004580"` → `45.80` L) — not a plain binary integer.

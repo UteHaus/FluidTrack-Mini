@@ -23,7 +23,7 @@ else
 endif
 
 .DEFAULT_GOAL := help
-.PHONY: help sync update run run-cli login cloud-sync check test find-device inspect-key \
+.PHONY: help sync update run run-cli login cloud-sync check lint format test find-device inspect-key \
         backup-db build build-linux build-windows run-build package clean udev
 
 help: ## Show this help
@@ -53,8 +53,7 @@ login: ## Nextcloud browser login, e.g. make login URL=https://cloud.example.com
 	cd $(SRC) && $(UV) run python nextcloud_login.py "$(URL)"
 
 cloud-sync: ## One-off: compare local DB with Nextcloud and upload missing rows
-	cd $(SRC) && $(UV) run python -c "import main; db, cloud, enabled = main.initialize(); \
-		main.sync_pending_transactions(db, cloud) if enabled else print('[i] Nextcloud is not configured.')"
+	cd $(SRC) && $(UV) run python -c "import main, sys; sys.exit(main.run_cloud_sync())"
 
 # --- Hardware / diagnostics --------------------------------------------------
 
@@ -76,6 +75,14 @@ udev: ## Linux: install udev rule so the DS9490R works without sudo
 check: ## Syntax-check all Python sources
 	$(UV) run python -m py_compile $(wildcard $(SRC)/*.py)
 	@echo "OK"
+
+lint: ## Lint and check formatting with ruff (no changes)
+	$(UV) run ruff check src tests
+	$(UV) run ruff format --check src tests
+
+format: ## Auto-fix lint findings and reformat the code with ruff
+	$(UV) run ruff check --fix src tests
+	$(UV) run ruff format src tests
 
 test: ## Run the unit tests (USB adapter simulated, no hardware needed)
 	$(UV) run python -m unittest discover -s tests -v

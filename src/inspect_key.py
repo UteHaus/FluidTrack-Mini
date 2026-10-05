@@ -40,9 +40,9 @@ def find_keys_on_bus(master_bus):
     slaves_file = os.path.join(W1_DEVICES_DIR, master_bus, "w1_master_slaves")
     if not os.path.exists(slaves_file):
         return []
-    with open(slaves_file, "r") as f:
+    with open(slaves_file) as f:
         lines = [line.strip() for line in f if line.strip()]
-    return [l for l in lines if "not found" not in l]
+    return [line for line in lines if "not found" not in line]
 
 
 def read_key_files(key_id, only_file=None):
@@ -91,7 +91,7 @@ def hexdump(data, width=16):
     """Klassischer hexdump -C Stil: Offset | Hex-Bytes | ASCII."""
     lines = []
     for offset in range(0, len(data), width):
-        chunk = data[offset:offset + width]
+        chunk = data[offset : offset + width]
         hex_part = " ".join(f"{b:02x}" for b in chunk)
         hex_part = hex_part.ljust(width * 3 - 1)
         ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
@@ -101,8 +101,12 @@ def hexdump(data, width=16):
 
 def main():
     parser = argparse.ArgumentParser(description="PIUSI iButton Rohdaten-Inspektor")
-    parser.add_argument("--save", action="store_true", help="Rohdaten zusaetzlich als .bin Datei speichern")
-    parser.add_argument("--file", choices=CANDIDATE_FILES, help="Nur eine bestimmte Interface-Datei lesen")
+    parser.add_argument(
+        "--save", action="store_true", help="Rohdaten zusaetzlich als .bin Datei speichern"
+    )
+    parser.add_argument(
+        "--file", choices=CANDIDATE_FILES, help="Nur eine bestimmte Interface-Datei lesen"
+    )
     args = parser.parse_args()
 
     print(f"[+] Starte Rohdaten-Inspektion auf {platform.system()}...\n")
@@ -133,7 +137,9 @@ def main():
         print(f"=== Schluessel: {key_id} ===")
         file_data = read_key_files(key_id, only_file=args.file)
         if not file_data:
-            print("    [!] Keine der erwarteten Interface-Dateien (rw/memory/eeprom/w1_slave) lesbar.")
+            print(
+                "    [!] Keine der erwarteten Interface-Dateien (rw/memory/eeprom/w1_slave) lesbar."
+            )
         results_by_key[key_id] = file_data
 
     # Ausgabe + optionales Speichern

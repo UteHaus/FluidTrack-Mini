@@ -26,6 +26,32 @@ COLUMN_DEFINITIONS = {
 ROWS_PAGE_SIZE = 500
 
 
+def parse_share_targets(value):
+    """NEXTCLOUD_SHARE_WITH -> [(receiver_type, name)].
+    Comma-separated; "user:anna" shares with a user, "group:Fahrer" or a
+    plain name with a group."""
+    targets = []
+    for item in (value or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        kind, _, name = item.partition(":")
+        if name and kind.strip().lower() in ("user", "group"):
+            targets.append((kind.strip().lower(), name.strip()))
+        else:
+            targets.append(("group", item))
+    return targets
+
+
+def _can_write(table):
+    """Own tables are always writable. For tables shared WITH us, the share
+    must grant 'create' (the API reports read-only-looking permissions for
+    own tables, so they must not be judged by onSharePermissions)."""
+    if not table.get("isShared"):
+        return True
+    return bool((table.get("onSharePermissions") or {}).get("create"))
+
+
 class NextcloudTablesSync:
     def __init__(self):
         self.url = os.getenv("NEXTCLOUD_URL")
@@ -42,11 +68,15 @@ class NextcloudTablesSync:
         # Set once the local DB has been fully compared with the Nextcloud table.
         self.reconciled = False
 
+        # Shared use: several users/installations write into ONE table.
+        self.share_targets = parse_share_targets(os.getenv("NEXTCLOUD_SHARE_WITH", ""))
+        self.table_info = {}  # API data of the selected table (owner, sharing)
+        self._shares_checked = False
+        self._reported_duplicates = None
+
         self.base_api_url = f"{self.url.rstrip('/')}{TABLES_API_PATH}" if self.url else ""
         self.headers = {"OCS-APIRequest": "true", "Accept": "application/json"}
-        self.auth = (
-            HTTPBasicAuth(self.user, self.token) if self.user and self.token else None
-        )
+        self.auth = HTTPBasicAuth(self.user, self.token) if self.user and self.token else None
 
     def is_configured(self):
         """Returns whether Nextcloud is configured at all (URL + credentials
@@ -98,6 +128,9 @@ class NextcloudTablesSync:
         if not self.connected:
             return t("nc_not_connected", error=(self.last_error or t("nc_unknown_error"))[:90])
         text = t("nc_connected", title=self.table_title, table_id=self.table_id)
+        if self.table_info.get("isShared"):
+            owner = self.table_info.get("ownerDisplayName") or self.table_info.get("ownership")
+            text += t("nc_shared_by", owner=owner)
         if self.last_sync_at:
             text += t("nc_last_upload", time=self.last_sync_at.strftime("%H:%M:%S"))
         return text
@@ -109,7 +142,7 @@ class NextcloudTablesSync:
         if not os.path.exists(env_path):
             open(env_path, "a").close()
 
-        with open(env_path, "r") as f:
+        with open(env_path) as f:
             lines = f.readlines()
 
         updated = False
@@ -135,21 +168,94 @@ class NextcloudTablesSync:
     # ---------------------------------------------------------------
 
     def _find_table(self):
-        """Returns the ID of the target table: the configured NEXTCLOUD_TABLE_ID
-        if it still exists, otherwise the first table matching the title."""
+        """Returns the ID of the target table, or None if none exists yet.
+
+        Several users can see several tables with the same title: their own
+        and ones shared with them. All of them must end up writing into the
+        SAME table, so the choice is deterministic: the OLDEST table with the
+        title that this account may write to. Once the first user's table is
+        shared with the others, every installation picks that one.
+
+        NEXTCLOUD_TABLE_ID only caches the result; it is never trusted on its
+        own (an ID from another server can belong to a foreign table)."""
         tables = self._request("GET", "/tables")
-        ids = {str(t.get("id")) for t in tables}
-        if self.table_id and self.table_id in ids:
-            return self.table_id
-        if self.table_id:
-            print(
-                f"[!] Configured NEXTCLOUD_TABLE_ID={self.table_id} does not exist "
-                f"on the server -- looking up the table by title instead."
+        by_id = {str(t.get("id")): t for t in tables}
+        if self.table_id and by_id.get(self.table_id, {}).get("title") != self.table_title:
+            reason = (
+                "does not exist on this server"
+                if self.table_id not in by_id
+                else f"is the table {by_id[self.table_id].get('title')!r}"
             )
-        for table in tables:
-            if table.get("title") == self.table_title:
-                return str(table.get("id"))
-        return None
+            print(f"[!] Stored NEXTCLOUD_TABLE_ID={self.table_id} {reason} -- ignoring it.")
+
+        candidates = [
+            tbl
+            for tbl in tables
+            if tbl.get("title") == self.table_title and not tbl.get("archived")
+        ]
+        writable = [tbl for tbl in candidates if _can_write(tbl)]
+        for tbl in candidates:
+            if tbl not in writable:
+                print(
+                    f"[!] Table '{self.table_title}' (ID {tbl.get('id')}) shared by "
+                    f"{tbl.get('ownerDisplayName') or tbl.get('ownership')} is read-only for "
+                    f"this account -- ask the owner to allow creating rows."
+                )
+        if not writable:
+            self.table_info = {}
+            return None
+
+        chosen = min(
+            writable, key=lambda tbl: (tbl.get("createdAt") or "", int(tbl.get("id") or 0))
+        )
+        others = sorted(str(tbl.get("id")) for tbl in writable if tbl is not chosen)
+        if others and others != self._reported_duplicates:
+            owner = chosen.get("ownerDisplayName") or chosen.get("ownership")
+            print(
+                f"[i] Several tables named '{self.table_title}' are visible "
+                f"(IDs {', '.join([str(chosen.get('id'))] + others)}). Using the oldest one, "
+                f"ID {chosen.get('id')} of {owner}. Records are uploaded there; "
+                f"the others can be deleted once they are obsolete."
+            )
+            self._reported_duplicates = others
+        self.table_info = chosen
+        return str(chosen.get("id"))
+
+    def _ensure_shares(self):
+        """Shares OUR table with NEXTCLOUD_SHARE_WITH (read + create rows only),
+        so other users find and use it instead of creating their own.
+        Runs once per session; failures are reported but not fatal."""
+        if self._shares_checked or not self.share_targets:
+            return
+        if self.table_info.get("isShared"):
+            self._shares_checked = True  # not our table -- the owner shares it
+            return
+        try:
+            existing = {
+                (str(s.get("receiverType")).lower(), str(s.get("receiver")))
+                for s in self._request("GET", f"/tables/{self.table_id}/shares")
+            }
+            for receiver_type, receiver in self.share_targets:
+                if (receiver_type, receiver) in existing:
+                    continue
+                self._request(
+                    "POST",
+                    f"/tables/{self.table_id}/shares",
+                    json={
+                        "receiver": receiver,
+                        "receiverType": receiver_type,
+                        "permissionRead": True,
+                        "permissionCreate": True,
+                        "permissionUpdate": False,
+                        "permissionDelete": False,
+                        "permissionManage": False,
+                    },
+                )
+                print(f"[C] Shared table {self.table_id} with {receiver_type} '{receiver}'.")
+            self._shares_checked = True
+        except Exception as e:
+            print(f"[!] Could not share the table with {self.share_targets}: {e}")
+            self._shares_checked = True  # don't retry every minute; restart to retry
 
     def _create_table(self):
         created = self._request(
@@ -164,6 +270,16 @@ class NextcloudTablesSync:
         """Resolves column titles to IDs and creates any missing columns."""
         existing = self._request("GET", f"/tables/{self.table_id}/columns")
         self.column_ids = {c["title"]: c["id"] for c in existing}
+
+        missing = [title for title in COLUMN_DEFINITIONS if title not in self.column_ids]
+        manage = (self.table_info.get("onSharePermissions") or {}).get("manage")
+        if missing and self.table_info.get("isShared") and not manage:
+            owner = self.table_info.get("ownerDisplayName") or self.table_info.get("ownership")
+            raise RuntimeError(
+                f"Shared table is missing the column(s) {', '.join(missing)} and this "
+                f"account may not add them. {owner} must start FluidTrack-Mini once "
+                f"to complete the table."
+            )
 
         for title, definition in COLUMN_DEFINITIONS.items():
             if title in self.column_ids:
@@ -192,9 +308,16 @@ class NextcloudTablesSync:
                 table_id = self._create_table()
             if table_id != os.getenv("NEXTCLOUD_TABLE_ID", "").strip():
                 self._write_id_to_env(table_id)
+            if self.table_id and table_id != self.table_id:
+                # Switched tables (e.g. now using a table shared by a colleague):
+                # compare everything again so all local records get uploaded there.
+                print(f"[C] Switching from table {self.table_id} to table {table_id}.")
+                self.reconciled = False
+                self.column_ids = {}
             self.table_id = table_id
 
             self._ensure_columns()
+            self._ensure_shares()
             self._set_state(True)
             if verbose or was_connected is not True:
                 print(f"[C] Nextcloud connected, table ready (ID: {self.table_id}).")

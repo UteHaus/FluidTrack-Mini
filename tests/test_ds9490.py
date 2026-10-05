@@ -253,6 +253,212 @@ class ReadTests(unittest.TestCase):
             ds._read_data(1)  # nothing queued -> simulated USB timeout
 
 
+class ScratchpadDS1996:
+    """Byte-level DS1996 NV-RAM model (datasheet behavior): the scratchpad
+    covers ONE 32-byte page; bytes written past its end are dropped and set
+    the OF flag, Read Scratchpad returns data from the target offset to the
+    end of the scratchpad followed by 0xFF, Copy Scratchpad commits T..E."""
+
+    def __init__(self, memory):
+        self.memory = bytearray(memory)
+        self.pad = bytearray(32)
+        self.ta, self.es = 0, 0
+        self.out = []
+        self.cmd = None
+
+    def match_rom(self, rom_id):
+        self.cmd, self.args, self.out = None, [], []
+
+    def write_byte(self, b):
+        if self.cmd is None:
+            self.cmd = b
+            if b == d.CMD_READ_SCRATCHPAD:
+                start = self.ta & 0x1F
+                self.out = [self.ta & 0xFF, self.ta >> 8, self.es] + list(self.pad[start:])
+            return b
+        self.args.append(b)
+        if self.cmd == d.CMD_WRITE_SCRATCHPAD and len(self.args) > 2:
+            if len(self.args) == 3:
+                self.ta, self.es = self.args[0] | self.args[1] << 8, 0
+            offset = (self.ta & 0x1F) + len(self.args) - 3
+            if offset > 31:
+                self.es |= 0x40
+            else:
+                self.pad[offset] = b
+                self.es = (self.es & 0xE0) | offset
+        elif self.cmd == d.CMD_COPY_SCRATCHPAD and len(self.args) == 3:
+            page = self.ta & ~0x1F
+            for i in range(self.ta & 0x1F, (self.es & 0x1F) + 1):
+                self.memory[page + i] = self.pad[i]
+        return b
+
+    def read_byte(self):
+        return self.out.pop(0) if self.out else 0xFF
+
+    def read_block(self, n):
+        return bytes(self.read_byte() for _ in range(n))
+
+
+def key_with_records(count=5):
+    """16-byte header + `count` records in the real layout: block i holds the
+    name of record i-1 and the data (liters/date/time as BCD) of record i."""
+    mem = bytearray(b"\xff" * 8192)
+    mem[:16] = b"V1.0      100001"
+    for i in range(count + 1):
+        block = 16 + i * 32
+        if i > 0:
+            mem[block : block + 16] = f"AB.CD.{i:<10}".encode()
+        if i < count:
+            mem[block + 16 : block + 25] = bytes([0x03, 0x00, 0x04, 0x15, 0x03, 0x24, 0x10, i, 1])
+    return bytes(mem)
+
+
+class EraseTests(unittest.TestCase):
+    def test_erase_blanks_whole_record_area(self):
+        """Regression: the erase used to write 32 bytes from address 16, i.e.
+        across every page boundary. Only the upper half of each page was
+        erased, the data halves survived and were re-read with a blank
+        (0xFF) name -> duplicate transactions with an unreadable plate."""
+        memory = key_with_records()
+        key = ScratchpadDS1996(memory)
+        self.assertEqual(len(d.scan_records(memory)), 5)
+        with mock.patch.object(d.time, "sleep"):
+            d.erase_ds1996_memory(key, "0c-0000001db780")
+        self.assertEqual(bytes(key.memory[:16]), memory[:16])
+        self.assertEqual(bytes(key.memory[16:]), b"\xff" * (len(memory) - 16))
+        self.assertEqual(d.scan_records(bytes(key.memory)), [])
+
+    def test_write_across_page_boundary_rejected(self):
+        with self.assertRaises(ValueError):
+            d.write_memory_page(ScratchpadDS1996(MEMORY), "0c-0000001db780", 16, b"\xff" * 32)
+
+    def test_half_erased_record_is_skipped(self):
+        """A valid data half next to a blank name half is not a transaction."""
+        data = bytearray(key_with_records())
+        for page in range(32, len(data), 32):
+            data[page + 16 : page + 32] = b"\xff" * 16
+        self.assertEqual(len(d.scan_records(bytes(key_with_records()))), 5)
+        self.assertEqual(d.scan_records(bytes(data)), [])
+
+
+def bcd(value):
+    return (value // 10) << 4 | (value % 10)
+
+
+def full_key(write_index=0x0E):
+    """A key with all 255 ring-buffer slots in use, laid out like the real
+    one: data half of record i at 0x20+32*i, its name at 0x30+32*i."""
+    mem = bytearray(8192)
+    mem[:16] = b"\x00\x00MCG_2." + bytes([write_index, 0]) + b"100001"
+    for i in range(255):
+        data = 0x20 + 32 * i
+        mem[data : data + 16] = (
+            bytes(
+                [0x01, bcd(i % 100), 0x50, bcd(i % 28 + 1), 0x09, 0x26, bcd(i % 24), bcd(i % 60), 4]
+            )
+            + b"\x00\x00\x00    "
+        )
+        mem[data + 16 : data + 32] = f"AB.CD.{i:<10}".encode()
+    return bytes(mem)
+
+
+def piusi_erased(memory):
+    """What the original PIUSI software leaves behind (observed on a real
+    key): names blanked except the last slot, write index reset to 0."""
+    mem = bytearray(memory)
+    for offset in d.record_name_offsets()[:-1]:
+        mem[offset : offset + 16] = b"\xff" * 16
+    mem[d.HEADER_WRITE_INDEX] = 0
+    return bytes(mem)
+
+
+class PiusiEraseTests(unittest.TestCase):
+    def _erase(self, memory):
+        key = ScratchpadDS1996(memory)
+        with mock.patch.object(d.time, "sleep"):
+            writes = d.erase_ds1996_records(key, "0c-0000001db780", current=memory)
+        return bytes(key.memory), writes
+
+    def test_layout_constants(self):
+        offsets = d.record_name_offsets()
+        self.assertEqual((offsets[0], offsets[-1], len(offsets)), (0x30, 0x1FF0, 255))
+        self.assertTrue(all(o % 32 == 16 for o in offsets))  # upper half of a page
+
+    def test_full_key_is_parsed(self):
+        memory = full_key()
+        self.assertEqual(len(d.scan_records(memory)), 255)
+        self.assertFalse(d.is_key_erased(memory))
+
+    def test_erase_matches_original_software(self):
+        memory = full_key()
+        erased, writes = self._erase(memory)
+        self.assertEqual(writes, 255 + 1)  # 255 names + header write index
+        # Identical to what PIUSI leaves, except the last name is blank too.
+        expected = bytearray(piusi_erased(memory))
+        expected[0x1FF0:0x2000] = b"\xff" * 16
+        self.assertEqual(erased, bytes(expected))
+        self.assertEqual(erased[d.HEADER_WRITE_INDEX], 0)
+        self.assertEqual(erased[:8] + erased[9:16], memory[:8] + memory[9:16])
+        self.assertTrue(d.is_key_erased(erased))
+        self.assertEqual(d.scan_records(erased), [])
+
+    def test_data_halves_untouched(self):
+        memory = full_key()
+        erased, _ = self._erase(memory)
+        for i in range(255):
+            data = 0x20 + 32 * i
+            self.assertEqual(erased[data : data + 16], memory[data : data + 16])
+
+    def test_key_erased_by_piusi_needs_only_last_name(self):
+        memory = piusi_erased(full_key())
+        self.assertEqual(len(d.scan_records(memory)), 1)  # the leftover record
+        erased, writes = self._erase(memory)
+        self.assertEqual(writes, 1)
+        self.assertTrue(d.is_key_erased(erased))
+        self.assertEqual(d.scan_records(erased), [])
+
+    def test_erased_key_needs_no_writes(self):
+        erased, _ = self._erase(full_key())
+        _, writes = self._erase(erased)
+        self.assertEqual(writes, 0)
+
+    def test_new_record_after_erase_is_read(self):
+        """The dispenser writes the next record into slot 0 (write index 0)."""
+        erased = bytearray(self._erase(full_key())[0])
+        erased[0x20:0x30] = bytes([0x00, 0x42, 0x17, 0x05, 0x10, 0x26, 0x08, 0x15, 3]) + bytes(7)
+        erased[0x30:0x40] = b"AB.CD.999       "
+        erased[d.HEADER_WRITE_INDEX] = 1
+        records = d.scan_records(bytes(erased))
+        self.assertEqual(
+            [(r["name"], r["date"], r["liters"]) for r in records],
+            [("AB.CD.999", "2026-10-05", 42.17)],
+        )
+
+    def test_interrupted_erase_can_be_repeated(self):
+        memory = full_key()
+        key = ScratchpadDS1996(memory)
+        real_write = d.write_memory_page
+        calls = {"n": 0}
+
+        def flaky_write(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 100:
+                raise d.DS2490Error("contact lost")
+            return real_write(*args, **kwargs)
+
+        with (
+            mock.patch.object(d.time, "sleep"),
+            mock.patch.object(d, "write_memory_page", flaky_write),
+        ):
+            with self.assertRaises(d.DS2490Error):
+                d.erase_ds1996_records(key, "0c-0000001db780", current=memory)
+        half = bytes(key.memory)
+        self.assertEqual(half[d.HEADER_WRITE_INDEX], 0x0E)  # header is written last
+        with mock.patch.object(d.time, "sleep"):
+            d.erase_ds1996_records(key, "0c-0000001db780", current=half)
+        self.assertTrue(d.is_key_erased(bytes(key.memory)))
+
+
 class OpenCloseTests(unittest.TestCase):
     """Windows behavior of opening/closing, with a mocked pyusb device."""
 
@@ -349,9 +555,11 @@ class BackendTests(unittest.TestCase):
                 seen["path"] = find_library("usb-1.0")
                 return "backend"
 
-            with mock.patch.object(d, "IS_WINDOWS", True), mock.patch.object(
-                d.sys, "_MEIPASS", bundle, create=True
-            ), mock.patch("usb.backend.libusb1.get_backend", fake_get_backend):
+            with (
+                mock.patch.object(d, "IS_WINDOWS", True),
+                mock.patch.object(d.sys, "_MEIPASS", bundle, create=True),
+                mock.patch("usb.backend.libusb1.get_backend", fake_get_backend),
+            ):
                 self.assertEqual(d._usb_backend(), "backend")
             self.assertEqual(seen["path"], dll)
 
@@ -360,17 +568,23 @@ class MainDetectionTests(unittest.TestCase):
     def test_falls_back_to_usb_without_sysfs(self):
         import main
 
-        with mock.patch.object(main.os.path, "isdir", return_value=False), mock.patch.object(
-            main, "find_ds1996_rom_id_usb", return_value="0c-0000001db780"
-        ) as usb_search:
+        with (
+            mock.patch.object(main.os.path, "isdir", return_value=False),
+            mock.patch.object(
+                main, "find_ds1996_rom_id_usb", return_value="0c-0000001db780"
+            ) as usb_search,
+        ):
             self.assertEqual(main.find_ds1996_rom_id(), "0c-0000001db780")
             usb_search.assert_called_once()
 
     def test_usb_errors_do_not_crash_detection(self):
         import main
 
-        with mock.patch.object(main.os.path, "isdir", return_value=False), mock.patch.object(
-            main, "find_ds1996_rom_id_usb", side_effect=d.DS2490Error("No DS9490R found.")
+        with (
+            mock.patch.object(main.os.path, "isdir", return_value=False),
+            mock.patch.object(
+                main, "find_ds1996_rom_id_usb", side_effect=d.DS2490Error("No DS9490R found.")
+            ),
         ):
             self.assertIsNone(main.find_ds1996_rom_id())
 

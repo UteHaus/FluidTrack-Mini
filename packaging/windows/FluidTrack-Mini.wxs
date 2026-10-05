@@ -1,0 +1,58 @@
+<!--
+  Per-user MSI installer for the PyInstaller build (WiX v5).
+
+  Installs into %LOCALAPPDATA%\Programs\FluidTrack-Mini without admin rights.
+  The app keeps .env and FluidTrack.db next to the executable (see src/paths.py),
+  so the install folder must be writable by the user -- which is why this is not
+  a per-machine install into Program Files. Both files are created at runtime and
+  are not part of the package, so they survive upgrades and uninstalls.
+
+  Built in CI (.github/workflows/build.yml):
+    wix build packaging/windows/FluidTrack-Mini.wxs -arch x64
+      -d Version=<x.y.z> -d SourceDir=<abs path to dist/FluidTrack-Mini>
+      -sice ICE38 -sice ICE64 -sice ICE91 -o FluidTrack-Mini-windows.msi
+  The suppressed ICEs only complain that files in a user profile folder should
+  use registry key paths, which a harvested per-user install can't satisfy.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="FluidTrack-Mini"
+    Manufacturer="UteHaus"
+    Version="$(var.Version)"
+    UpgradeCode="18db5f51-9f80-4bae-b226-fab927eb171b"
+    Scope="perUser"
+    Compressed="yes">
+
+    <!-- Never change the UpgradeCode: it links all versions, so installing a
+         new MSI replaces the old one instead of installing side by side. -->
+    <MajorUpgrade
+      AllowSameVersionUpgrades="yes"
+      DowngradeErrorMessage="A newer version of FluidTrack-Mini is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="FluidTrack-Mini" />
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main">
+      <Files Include="$(var.SourceDir)\**" Directory="INSTALLFOLDER" />
+
+      <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder">
+        <Shortcut
+          Id="AppStartMenuShortcut"
+          Name="FluidTrack-Mini"
+          Target="[INSTALLFOLDER]FluidTrack-Mini.exe"
+          WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\UteHaus\FluidTrack-Mini"
+          Name="StartMenuShortcut"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+    </Feature>
+  </Package>
+</Wix>

@@ -9,3 +9,4 @@ backups/
 *.py[cod]
 
 *.db
+*.db.lock
