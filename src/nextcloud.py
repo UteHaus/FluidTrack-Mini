@@ -5,6 +5,8 @@ import requests
 from requests.auth import HTTPBasicAuth
 
 from i18n import t
+from nextcloud_login import write_env_values
+from paths import ENV_PATH
 
 # Nextcloud Tables REST API v1. Note: this lives under /index.php, NOT under
 # /ocs/v2.php -- the OCS endpoint only exists as ".../api/2" and uses a
@@ -137,31 +139,9 @@ class NextcloudTablesSync:
 
     def _write_id_to_env(self, new_id):
         """Persistently writes the Table ID back to the .env file."""
-        from paths import ENV_PATH as env_path
-
-        if not os.path.exists(env_path):
-            open(env_path, "a").close()
-
-        with open(env_path) as f:
-            lines = f.readlines()
-
-        updated = False
-        with open(env_path, "w") as f:
-            for line in lines:
-                if line.startswith("NEXTCLOUD_TABLE_ID="):
-                    f.write(f'NEXTCLOUD_TABLE_ID="{new_id}"\n')
-                    updated = True
-                else:
-                    f.write(line)
-
-            # If the variable didn't exist yet, append it to the end
-            if not updated:
-                if lines and not lines[-1].endswith("\n"):
-                    f.write("\n")
-                f.write(f'NEXTCLOUD_TABLE_ID="{new_id}"\n')
-
+        write_env_values(ENV_PATH, {"NEXTCLOUD_TABLE_ID": new_id})
         os.environ["NEXTCLOUD_TABLE_ID"] = str(new_id)
-        print(f'[C] Saved NEXTCLOUD_TABLE_ID="{new_id}" to {env_path}.')
+        print(f'[C] Saved NEXTCLOUD_TABLE_ID="{new_id}" to {ENV_PATH}.')
 
     # ---------------------------------------------------------------
     # Table / column provisioning
@@ -329,11 +309,6 @@ class NextcloudTablesSync:
             if verbose or was_connected is not False:
                 print(f"[!] Nextcloud connection/table setup failed: {e}")
             return False
-
-    def check_connection(self):
-        """Periodic health check: re-validates table and columns (re-creating
-        or re-resolving them if they were deleted or the ID is missing)."""
-        return self.verify_or_create_table(verbose=False)
 
     # ---------------------------------------------------------------
     # Row upload

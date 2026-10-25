@@ -23,7 +23,7 @@ else
 endif
 
 .DEFAULT_GOAL := help
-.PHONY: help sync update run run-cli login cloud-sync check lint format test find-device inspect-key \
+.PHONY: help sync update run run-cli login cloud-sync check lint format test find-device \
         backup-db build build-linux build-windows run-build package clean udev
 
 help: ## Show this help
@@ -59,9 +59,6 @@ cloud-sync: ## One-off: compare local DB with Nextcloud and upload missing rows
 
 find-device: ## Open the DS9490R over USB and list all 1-Wire devices
 	cd $(SRC) && $(UV) run python find-device.py
-
-inspect-key: ## Hexdump the raw key memory (saves a .bin copy)
-	cd $(SRC) && $(UV) run python inspect_key.py --save
 
 udev: ## Linux: install udev rule so the DS9490R works without sudo
 	echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="04fa", ATTR{idProduct}=="2490", MODE="0666"' | \

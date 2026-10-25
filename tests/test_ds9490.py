@@ -225,12 +225,6 @@ class ReadTests(unittest.TestCase):
         data = d.read_ds1996_memory(sim_ds9490(bus_with_key()), "0c-0000001db780", 0, 300)
         self.assertEqual(data, MEMORY[:300])
 
-    def test_read_with_skip_rom(self):
-        data = d.read_ds1996_memory(
-            sim_ds9490(bus_with_key()), "0c-0000001db780", 16, 200, rom_mode="skip"
-        )
-        self.assertEqual(data, MEMORY[16:216])
-
     def test_old_byte_order_never_matched(self):
         """Regression: the old conversion did not reverse the serial, so
         Match ROM selected nothing and reads returned 0xFF only."""
@@ -314,20 +308,6 @@ def key_with_records(count=5):
 
 
 class EraseTests(unittest.TestCase):
-    def test_erase_blanks_whole_record_area(self):
-        """Regression: the erase used to write 32 bytes from address 16, i.e.
-        across every page boundary. Only the upper half of each page was
-        erased, the data halves survived and were re-read with a blank
-        (0xFF) name -> duplicate transactions with an unreadable plate."""
-        memory = key_with_records()
-        key = ScratchpadDS1996(memory)
-        self.assertEqual(len(d.scan_records(memory)), 5)
-        with mock.patch.object(d.time, "sleep"):
-            d.erase_ds1996_memory(key, "0c-0000001db780")
-        self.assertEqual(bytes(key.memory[:16]), memory[:16])
-        self.assertEqual(bytes(key.memory[16:]), b"\xff" * (len(memory) - 16))
-        self.assertEqual(d.scan_records(bytes(key.memory)), [])
-
     def test_write_across_page_boundary_rejected(self):
         with self.assertRaises(ValueError):
             d.write_memory_page(ScratchpadDS1996(MEMORY), "0c-0000001db780", 16, b"\xff" * 32)
@@ -565,26 +545,20 @@ class BackendTests(unittest.TestCase):
 
 
 class MainDetectionTests(unittest.TestCase):
-    def test_falls_back_to_usb_without_sysfs(self):
+    def test_detects_key_over_usb(self):
         import main
 
-        with (
-            mock.patch.object(main.os.path, "isdir", return_value=False),
-            mock.patch.object(
-                main, "find_ds1996_rom_id_usb", return_value="0c-0000001db780"
-            ) as usb_search,
-        ):
+        with mock.patch.object(
+            main, "find_ds1996_rom_id_usb", return_value="0c-0000001db780"
+        ) as usb_search:
             self.assertEqual(main.find_ds1996_rom_id(), "0c-0000001db780")
             usb_search.assert_called_once()
 
     def test_usb_errors_do_not_crash_detection(self):
         import main
 
-        with (
-            mock.patch.object(main.os.path, "isdir", return_value=False),
-            mock.patch.object(
-                main, "find_ds1996_rom_id_usb", side_effect=d.DS2490Error("No DS9490R found.")
-            ),
+        with mock.patch.object(
+            main, "find_ds1996_rom_id_usb", side_effect=d.DS2490Error("No DS9490R found.")
         ):
             self.assertIsNone(main.find_ds1996_rom_id())
 

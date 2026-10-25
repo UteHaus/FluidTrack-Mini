@@ -55,11 +55,12 @@ class UploadEventsTests(unittest.TestCase):
 
     def test_end_is_reported_after_an_exception(self):
         db = mock.Mock()
-        db.get_unsynced_transactions.return_value = [(1, "s", "t", 1.0, "X", "k", "h1")]
+        db.has_unsynced_transactions.return_value = True
+        db.get_sync_candidates.return_value = [(1, "h1", "s", "t", 1.0, "X", "k", 0)]
         cloud = mock.Mock()
-        cloud.check_connection.return_value = True
+        cloud.verify_or_create_table.return_value = True
         cloud.reconciled = True
-        cloud.is_ready.return_value = False
+        cloud.get_uploaded_hashes.return_value = set()
         cloud.upload_row.side_effect = RuntimeError("boom")
         main._last_pending_sync = 0
         with self.assertRaises(RuntimeError):

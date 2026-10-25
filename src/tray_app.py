@@ -33,7 +33,6 @@ import os
 import queue
 import sys
 import threading
-import time
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
@@ -210,10 +209,8 @@ class ControlApp:
             color, text = COLOR_BUSY, t("key_pending", rom=rom_id)
         elif key_state == KEY_SYNCED:
             color, text = COLOR_ACTIVE, t("key_synced", rom=rom_id)
-        elif self.runner_active.is_set():
-            color, text = COLOR_ACTIVE, t("runner_active", seconds=POLL_INTERVAL_SECONDS)
         else:
-            color, text = COLOR_INACTIVE, t("runner_paused")
+            color, text = COLOR_ACTIVE, t("runner_active", seconds=POLL_INTERVAL_SECONDS)
         self.status_canvas.itemconfigure(self.status_dot, fill=color)
         self.status_label.configure(text=text)
         self.toggle_button.configure(
@@ -426,12 +423,8 @@ class ControlApp:
                     )
                 except Exception as e:
                     print(f"[!] Error during poll cycle: {e}")
-            # Sleep in small steps so Quit/toggle react quickly instead of
-            # waiting out a full POLL_INTERVAL_SECONDS.
-            slept = 0.0
-            while slept < POLL_INTERVAL_SECONDS and not self.stop_requested.is_set():
-                time.sleep(0.2)
-                slept += 0.2
+            # Returns early on Quit instead of waiting out the full interval.
+            self.stop_requested.wait(POLL_INTERVAL_SECONDS)
 
     def run(self):
         try:

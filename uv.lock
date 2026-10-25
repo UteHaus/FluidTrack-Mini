@@ -141,8 +141,6 @@ version = "0.2.0"
 source = { virtual = "." }
 dependencies = [
     { name = "libusb-package" },
-    { name = "pyownet" },
-    { name = "pyserial" },
     { name = "python-dotenv" },
     { name = "pyusb" },
     { name = "requests" },
@@ -158,8 +156,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "libusb-package", specifier = ">=1.0.30.0" },
-    { name = "pyownet", specifier = ">=0.10.0.post1" },
-    { name = "pyserial", specifier = ">=3.5" },
     { name = "python-dotenv", specifier = ">=1.2.3" },
     { name = "pyusb", specifier = ">=1.3.1" },
     { name = "requests", specifier = ">=2.34.2" },
@@ -276,24 +272,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c9/3b/fab1a12a21bf9223af012e5dd002b7d4265683d21d9fabbd0ccb347316e4/pyinstaller_hooks_contrib-2026.8.tar.gz", hash = "sha256:4d825786ad7a9b7dbcc52d612748a34562fe273461bcfd88f4d549c594bbf8f9", size = 176955, upload-time = "2026-09-30T07:53:52.56Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8f/f1/3eee0263b487e571aed9204257b45bc2a0b6fec34d0a1adade4d8d8a968c/pyinstaller_hooks_contrib-2026.8-py3-none-any.whl", hash = "sha256:6d21d65323ea4467753afc21f52d7d0e69416ae8101dd88269bf273ad48db084", size = 462145, upload-time = "2026-09-30T07:53:51.167Z" },
-]
-
-[[package]]
-name = "pyownet"
-version = "0.10.0.post1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/13/97/03560c37663b70cf503e9e0896c60646996de6b5730fd1a6f2f79bb869e2/pyownet-0.10.0.post1.tar.gz", hash = "sha256:4f2fa4471c2f806b35090bdc6c092305c6eded3ff3736f8b586d35bdb157de62", size = 17088, upload-time = "2019-01-19T14:46:25.503Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/01/c6/0e9960d960e90bec12cc5b21ae6b15dc00aaada0991782b122bc282e6f02/pyownet-0.10.0.post1-py3-none-any.whl", hash = "sha256:d229a39ecf924a9c7e419a2fcad9346fc931c9bd7062d6aa0e982f986ddb3341", size = 13778, upload-time = "2019-01-19T14:46:21.654Z" },
-]
-
-[[package]]
-name = "pyserial"
-version = "3.5"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/1e/7d/ae3f0a63f41e4d2f6cb66a5b57197850f919f59e558159a4dd3a818f5082/pyserial-3.5.tar.gz", hash = "sha256:3c77e014170dfffbd816e6ffc205e9842efb10be9f58ec16d3e8675b4925cddb", size = 159125, upload-time = "2020-11-23T03:59:15.045Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/07/bc/587a445451b253b285629263eb51c2d8e9bcea4fc97826266d186f96f558/pyserial-3.5-py2.py3-none-any.whl", hash = "sha256:c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0", size = 90585, upload-time = "2020-11-23T03:59:13.41Z" },
 ]
 
 [[package]]

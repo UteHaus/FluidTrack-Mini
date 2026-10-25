@@ -31,6 +31,7 @@ Usage:
 import argparse
 import datetime
 import os
+import re
 import sys
 import time
 
@@ -76,7 +77,6 @@ USB_TIMEOUT_MS = 2000  # generous: first transfers on Windows can be slow
 IDLE_TIMEOUT_S = 3.0  # max time to wait for the DS2490 to finish a command
 
 # Standard 1-Wire ROM commands (chip-independent)
-ROM_SKIP = 0xCC
 ROM_MATCH = 0x55
 ROM_SEARCH = 0xF0
 
@@ -519,10 +519,6 @@ class DS9490:
                 break
         return found
 
-    def skip_rom(self, debug=False):
-        self.onewire_reset(check_presence=debug)
-        self.write_byte(ROM_SKIP)
-
     def match_rom(self, rom_id_str: str, debug=False):
         rom_bytes = rom_id_to_bytes(rom_id_str)
         if not self.onewire_reset(check_presence=debug):
@@ -552,22 +548,14 @@ def read_ds1996_memory(
     rom_id: str,
     start_addr: int = 0,
     length: int = 8192,
-    rom_mode: str = "match",
     debug: bool = False,
 ) -> bytes:
     """
     Reads 'length' bytes starting at 'start_addr' from a DS1996's NV-RAM.
-
-    rom_mode="match": addresses the target device specifically via Match ROM
-        (safe when multiple devices are on the bus -- e.g. a second DS1420
-        identification chip, family 0x81).
-    rom_mode="skip": simpler Skip ROM mode (debugging/comparison only, since
-        it's ambiguous with multiple devices on the bus).
+    Addresses the key via Match ROM, which is safe when several devices are
+    on the bus (e.g. the DS1420 identification chip, family 0x81).
     """
-    if rom_mode == "skip":
-        ds.skip_rom(debug=debug)
-    else:
-        ds.match_rom(rom_id, debug=debug)
+    ds.match_rom(rom_id, debug=debug)
 
     ds.write_byte(CMD_READ_MEMORY)
     ds.write_byte(start_addr & 0xFF)  # TA1: address, low byte
@@ -586,8 +574,6 @@ ES_FLAGS_MASK = 0x60  # E/S byte: OF (overflow, bit 6) | PF (partial byte, bit 5
 
 def write_scratchpad(ds: DS9490, rom_id: str, start_addr: int, data: bytes):
     """Writes up to 32 bytes into the scratchpad buffer (NOT directly into NV-RAM)."""
-    if len(data) > 32:
-        raise ValueError("The scratchpad holds a maximum of 32 bytes per write.")
     ds.match_rom(rom_id)
     ds.write_byte(CMD_WRITE_SCRATCHPAD)
     ds.write_byte(start_addr & 0xFF)
@@ -660,40 +646,6 @@ def write_memory_page(ds: DS9490, rom_id: str, start_addr: int, data: bytes):
             "data sent -- Copy Scratchpad will NOT be executed."
         )
     copy_scratchpad(ds, rom_id, ta1, ta2, es)
-
-
-def erase_ds1996_memory(
-    ds: DS9490,
-    rom_id: str,
-    start_addr: int = 16,
-    length: int = 8176,
-    fill_byte: int = 0xFF,
-    progress_callback=None,
-):
-    """
-    Low-level tool, NOT used by the app (see erase_ds1996_records for the
-    erase that matches the original PIUSI software).
-
-    Overwrites the given memory range page by page (aligned to the 32-byte
-    pages) with fill_byte (default 0xFF, the observed 'blank' state). By default only the record
-    area from byte 16 onward is erased -- the 16-byte header (firmware
-    version + station number) is preserved.
-
-    Aborts immediately on a verification failure (raises DS2490Error), so a
-    partially erased/inconsistent state never goes unnoticed.
-    """
-    offset = start_addr
-    end = start_addr + length
-    blank_page = bytes([fill_byte] * PAGE_SIZE)
-
-    while offset < end:
-        # Never cross a page boundary: the default start (16) is mid-page, so
-        # the first chunk is only 16 bytes long, all following ones are aligned.
-        chunk_len = min(PAGE_SIZE - offset % PAGE_SIZE, end - offset)
-        write_memory_page(ds, rom_id, offset, blank_page[:chunk_len])
-        if progress_callback:
-            progress_callback(offset + chunk_len, end)
-        offset += chunk_len
 
 
 # --- Key layout (reverse-engineered, see read_raw_blocks) -------------------
@@ -794,28 +746,10 @@ def hexdump(data: bytes, width: int = 16) -> str:
 
 
 def extract_strings(data: bytes, min_len: int = 4):
-    """
-    Finds contiguous readable ASCII sections (printable characters,
-    length >= min_len) in the raw dump -- useful for spotting interesting
-    content (station number, firmware tag, etc.) at a glance.
-    Returns a list of (offset, text) tuples.
-    """
-    found = []
-    current = bytearray()
-    start = None
-    for i, b in enumerate(data):
-        if 32 <= b < 127:
-            if start is None:
-                start = i
-            current.append(b)
-        else:
-            if len(current) >= min_len:
-                found.append((start, current.decode("ascii")))
-            current = bytearray()
-            start = None
-    if len(current) >= min_len:
-        found.append((start, current.decode("ascii")))
-    return found
+    """Readable ASCII runs (length >= min_len) in the raw dump as
+    (offset, text) tuples -- spots station number, firmware tag, etc."""
+    pattern = rb"[\x20-\x7e]{%d,}" % min_len
+    return [(m.start(), m.group().decode("ascii")) for m in re.finditer(pattern, data)]
 
 
 def bcd_to_int(byte_val: int):
@@ -939,13 +873,6 @@ def main():
         "--start", type=lambda x: int(x, 0), default=0, help="Start address (default: 0)"
     )
     parser.add_argument(
-        "--rom-mode",
-        choices=["match", "skip"],
-        default="match",
-        help="'match' (default, recommended) or 'skip' "
-        "(debugging only, with multiple devices on the bus)",
-    )
-    parser.add_argument(
         "--debug",
         action="store_true",
         help="Print presence/echo diagnostics during the ROM handshake",
@@ -964,12 +891,9 @@ def main():
     print("[+] Connecting to the DS9490R...")
     with DS9490() as ds:
         print(
-            f"[+] Reading {args.length} bytes from address 0x{args.start:04x} of {args.rom_id} "
-            f"(rom-mode={args.rom_mode})..."
+            f"[+] Reading {args.length} bytes from address 0x{args.start:04x} of {args.rom_id}..."
         )
-        data = read_ds1996_memory(
-            ds, args.rom_id, args.start, args.length, rom_mode=args.rom_mode, debug=args.debug
-        )
+        data = read_ds1996_memory(ds, args.rom_id, args.start, args.length, debug=args.debug)
 
     print()
     print(hexdump(data))

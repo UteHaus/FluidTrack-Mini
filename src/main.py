@@ -40,9 +40,6 @@ DELETE_KEY_AFTER_SYNC = os.getenv("DELETE_KEY_AFTER_SYNC", "false").strip().lowe
     "yes",
 )
 
-W1_DEVICES_DIR = "/sys/bus/w1/devices/"
-DS1996_FAMILY_PREFIX = "0c-"
-
 POLL_INTERVAL_SECONDS = 5
 PENDING_SYNC_INTERVAL_SECONDS = 60
 
@@ -54,50 +51,15 @@ def set_delete_key_after_sync(enabled):
     DELETE_KEY_AFTER_SYNC = bool(enabled)
 
 
-def _find_ds1996_rom_id_sysfs():
-    """
-    Linux only: asks the w1 kernel subsystem which ROM IDs are on the bus.
-    Returns (available, rom_id): available=False if no w1 bus master exists
-    (Windows, module not loaded, or the kernel driver was detached by an
-    earlier direct USB access).
-
-    Explicitly filters for the DS1996 family (prefix '0c-'), since a second
-    device without user memory can also be on the bus (e.g. a DS1420
-    identification chip, family 0x81).
-    """
-    if not os.path.isdir(W1_DEVICES_DIR):
-        return False, None
-
-    master_dirs = [d for d in os.listdir(W1_DEVICES_DIR) if d.startswith("w1_bus_master")]
-    if not master_dirs:
-        return False, None
-
-    slaves_file = os.path.join(W1_DEVICES_DIR, master_dirs[0], "w1_master_slaves")
-    if not os.path.exists(slaves_file):
-        return False, None
-
-    with open(slaves_file) as f:
-        candidates = [line.strip() for line in f if line.strip() and "not found" not in line]
-
-    for rom_id in candidates:
-        if rom_id.lower().startswith(DS1996_FAMILY_PREFIX):
-            return True, rom_id
-    return True, None
-
-
 _last_usb_error = None
 
 
 def find_ds1996_rom_id():
     """
-    Detects the DS1996 key's ROM ID. Uses the Linux w1 sysfs files when they
-    exist (known to work), otherwise searches the 1-Wire bus directly over
-    USB -- the only option on Windows. Both return the same ID notation.
+    Detects the DS1996 key's ROM ID by searching the 1-Wire bus directly
+    over USB (Linux and Windows, no kernel driver needed).
     """
     global _last_usb_error
-    available, rom_id = _find_ds1996_rom_id_sysfs()
-    if available:
-        return rom_id
     try:
         rom_id = find_ds1996_rom_id_usb()
         _last_usb_error = None
@@ -116,9 +78,6 @@ def format_license_plate(raw_value):
     notation (DD-EE 12). Equipment names like 'FORKLIFT' or 'EXCAVATOR..NO',
     which don't match the plate pattern, are returned unchanged.
     """
-    if not isinstance(raw_value, str):
-        return raw_value
-
     # Regex pattern: 1-3 letters, a dot, 1-2 letters, a dot, 1-4 digits
     plate_pattern = r"^([A-Z]{1,3})\.([A-Z]{1,2})\.(\d{1,4})$"
 
@@ -204,10 +163,7 @@ def _emit_upload(busy):
 
 
 @contextlib.contextmanager
-def _uploading(active=True):
-    if not active:
-        yield
-        return
+def _uploading():
     _emit_upload(True)
     try:
         yield
@@ -290,46 +246,19 @@ def sync_pending_transactions(db, cloud):
     PENDING_SYNC_INTERVAL_SECONDS so an offline server doesn't flood the log:
       1. checks the connection and makes sure the table exists -- a missing
          or stale NEXTCLOUD_TABLE_ID is resolved/re-created automatically,
-      2. retries the upload for records stored locally but not yet
-         confirmed (sent=0), e.g. after a network outage."""
+      2. compares with Nextcloud and uploads what is missing -- after a
+         reconnect, or while records are not yet confirmed (sent=0)."""
     global _last_pending_sync
     if time.time() - _last_pending_sync < PENDING_SYNC_INTERVAL_SECONDS:
         return
     _last_pending_sync = time.time()
 
-    if not cloud.check_connection():
+    if not cloud.verify_or_create_table(verbose=False):
         cloud.reconciled = False  # do a full comparison again once reconnected
         return
 
-    if not cloud.reconciled:
+    if not cloud.reconciled or db.has_unsynced_transactions():
         reconcile_with_nextcloud(db, cloud)
-        return
-
-    pending = db.get_unsynced_transactions()
-    if not pending:
-        return
-
-    print(f"[C] Retrying Nextcloud upload for {len(pending)} pending transaction(s)...")
-    in_cloud = _hashes_in_nextcloud(cloud)
-    with _uploading():
-        synced = 0
-        for record_id, station, timestamp, liters, vehicle, key_id, record_hash in pending:
-            if record_hash in in_cloud:
-                db.mark_as_synced(record_id)  # uploaded by another installation
-                synced += 1
-                continue
-            if not cloud.upload_row(
-                station=station,
-                timestamp=timestamp,
-                liters=liters,
-                operator=vehicle,
-                key_id=key_id,
-                record_hash=record_hash,
-            ):
-                break  # server still unreachable/broken -- try again next interval
-            db.mark_as_synced(record_id)
-            synced += 1
-    print(f"[C] {synced}/{len(pending)} pending transaction(s) synced.")
 
 
 def _hashes_in_nextcloud(cloud):
@@ -358,8 +287,7 @@ def reconcile_with_nextcloud(db, cloud):
 
     records = db.get_sync_candidates()
     missing = [r for r in records if r[1] not in uploaded]
-    present_ids = [r[0] for r in records if r[1] in uploaded and r[7] != 1]
-    db.set_sent(present_ids, True)
+    db.set_sent([r[0] for r in records if r[1] in uploaded and r[7] != 1])
     # Records the DB thinks are synced but that are not in Nextcloud.
     db.set_sent([r[0] for r in missing if r[7] == 1], False)
 
@@ -368,7 +296,7 @@ def reconcile_with_nextcloud(db, cloud):
         f"local transaction(s) already in Nextcloud, {len(missing)} to upload."
     )
 
-    with _uploading(active=bool(missing)):
+    with _uploading() if missing else contextlib.nullcontext():
         synced = 0
         for record_id, record_hash, station, timestamp, liters, vehicle, key_id, _ in missing:
             if not cloud.upload_row(
@@ -381,7 +309,7 @@ def reconcile_with_nextcloud(db, cloud):
             ):
                 print(f"[!] Upload stopped after {synced}/{len(missing)}, will retry later.")
                 return
-            db.mark_as_synced(record_id)
+            db.set_sent([record_id])
             synced += 1
             if synced % 50 == 0:
                 print(f"[C] {synced}/{len(missing)} uploaded...")
@@ -440,7 +368,7 @@ def _store_and_upload(db, cloud, nextcloud_enabled, transactions):
             if in_cloud is None:
                 in_cloud = _hashes_in_nextcloud(cloud)
             if tx["hash"] in in_cloud:
-                db.mark_as_synced(record_id)
+                db.set_sent([record_id])
                 print("    [C] Already in Nextcloud (uploaded by another installation).")
                 continue
             uploaded = cloud.upload_row(
@@ -452,7 +380,7 @@ def _store_and_upload(db, cloud, nextcloud_enabled, transactions):
                 record_hash=tx["hash"],
             )
             if uploaded:
-                db.mark_as_synced(record_id)
+                db.set_sent([record_id])
                 print("    [C] Synced to Nextcloud.")
             else:
                 # Stays sent=0 -> retried by sync_pending_transactions().
@@ -461,7 +389,7 @@ def _store_and_upload(db, cloud, nextcloud_enabled, transactions):
             # Nextcloud is optional/not configured: local storage already
             # counts as done in this case (relevant for the erase
             # eligibility check below).
-            db.mark_as_synced(record_id)
+            db.set_sent([record_id])
             print("    [i] Stored locally only (Nextcloud not configured).")
 
     if new_count == 0:
@@ -550,7 +478,7 @@ def poll_once(db, cloud, nextcloud_enabled, on_key_state=None):
         return  # not remembered -> read again in the next cycle
 
     if transactions:
-        with _uploading(active=nextcloud_enabled):
+        with _uploading() if nextcloud_enabled else contextlib.nullcontext():
             _store_and_upload(db, cloud, nextcloud_enabled, transactions)
     else:
         print("[+] No valid transactions found on the key.")

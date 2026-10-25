@@ -26,5 +26,5 @@ FluidTrack-Mini/
 2. **License Plate Formatter (`main.py`):** Utilizes a Regular Expression parser to detect German vehicle identification plates stored within the PIUSI system in dot-notation (e.g., `DD.EE.1250`) and automatically reformats them into standard street notation (`DD-EE 1250`) before local or cloud synchronization.
 
 ## 🏁 Current Milestone & Next Steps
-* **Status:** System architectural separation into `main.py`, `database.py`, and `nextcloud.py` is completed and running bug-free. The engine safely initializes fallback schemas and sample data rows.
+* **Status:** System architectural separation into `main.py`, `database.py`, and `nextcloud.py` is completed and running bug-free. The engine safely initializes and migrates the local schema.
 * **Next Goal:** Build the binary decoder logic to parse the actual raw transaction bytes extracted from the physical `rw` memory dump of the PIUSI iButton key.

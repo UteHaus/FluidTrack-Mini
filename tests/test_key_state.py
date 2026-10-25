@@ -36,8 +36,8 @@ class FakeDB:
         self.rows[record_hash] = False
         return record_hash
 
-    def mark_as_synced(self, record_id):
-        self.rows[record_id] = True
+    def set_sent(self, record_ids, sent=True):
+        self.rows.update(dict.fromkeys(record_ids, sent))
 
     def is_synced(self, record_hash):
         return self.rows.get(record_hash, False)
@@ -110,7 +110,7 @@ class KeyStateTests(unittest.TestCase):
         self.cloud.upload_row.return_value = False  # Nextcloud down
         self.cycle()
         self.assertEqual(self.states[-1], main.KEY_PENDING)
-        self.db.mark_as_synced("h1")  # the retry in sync_pending_transactions succeeded
+        self.db.set_sent(["h1"])  # the retry in sync_pending_transactions succeeded
         self.cycle()
         self.assertEqual(self.states[-1], main.KEY_SYNCED)
         self.assertEqual(self.read.call_count, 1)
@@ -120,7 +120,7 @@ class KeyStateTests(unittest.TestCase):
         with mock.patch.object(main, "DELETE_KEY_AFTER_SYNC", True):
             self.cycle()
             self.erase.assert_not_called()
-            self.db.mark_as_synced("h1")
+            self.db.set_sent(["h1"])
             self.cycle()
             self.cycle()
         self.erase.assert_called_once_with(ROM)

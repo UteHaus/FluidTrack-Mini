@@ -160,12 +160,13 @@ def poll_for_credentials(poll_endpoint: str, poll_token: str):
 
 
 def write_env_values(env_path: str, values: dict):
-    """Updates existing variables in .env or appends new ones -- mirrors the
-    existing pattern in nextcloud.py (_write_id_to_env)."""
+    """Updates existing variables in .env or appends new ones."""
     lines = []
     if os.path.exists(env_path):
         with open(env_path) as f:
             lines = f.readlines()
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
 
     remaining = dict(values)
     with open(env_path, "w") as f:

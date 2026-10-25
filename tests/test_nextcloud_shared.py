@@ -177,7 +177,7 @@ class SwitchTests(unittest.TestCase):
         # Chris shares the older table with Anna.
         server.tables.append(table(10, "2026-10-02", shared=True, create=True))
         with quiet():
-            sync.check_connection()
+            sync.verify_or_create_table(verbose=False)
         self.assertEqual(sync.table_id, "10")
         self.assertFalse(sync.reconciled)
 
@@ -211,7 +211,7 @@ class SkipKnownUploadTests(unittest.TestCase):
         ):
             main.poll_once(db, cloud, True)
         cloud.upload_row.assert_not_called()
-        db.mark_as_synced.assert_called_once_with(7)
+        db.set_sent.assert_called_once_with([7])
 
 
 if __name__ == "__main__":
